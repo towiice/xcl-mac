@@ -1,7 +1,7 @@
 # XCL Mac Native — Apple Silicon & macOS Compatibility Layer for Xbox Series X|S
 
 [![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white)](https://discord.gg/dYuNEsQMQ)
-[![Mac cross-build](https://github.com/utkarshxdev/xcl-mac/actions/workflows/mac-cross.yml/badge.svg)](https://github.com/utkarshxdev/xcl-mac/actions/workflows/mac-cross.yml)
+[![Mac cross-build](https://github.com/utkarshxdev/xcl-mac/actions/workflows/mac-cross.yml/badge.svg?branch=main)](https://github.com/utkarshxdev/xcl-mac/actions/workflows/mac-cross.yml?query=branch%3Amain)
 [![Stage 6: Ingame 3D Rendering](https://img.shields.io/badge/Status-Stage%206%20(Ingame%203D)-success?logo=apple&color=34D399)](https://github.com/utkarshxdev/xcl-mac)
 [![License: GPL-2.0](https://img.shields.io/badge/License-GPL%202.0-blue.svg)](LICENSE)
 [![Platform: macOS](https://img.shields.io/badge/Platform-macOS%20%7C%20Apple%20Silicon-black?logo=apple)](https://github.com/utkarshxdev/xcl-mac)
