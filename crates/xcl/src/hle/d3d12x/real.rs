@@ -1153,6 +1153,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (93, l::kickoff_x as usize),
                 (94, l::set_depth_bias_x as usize),
                 (127, b::dispatch_mesh as usize),
+                (129, b::dispatch_mesh as usize),
                 // console compute/BVH builder extensions (`XboxBvhBuilder.dll`)
                 (146, l::uav_barrier_x as usize),
                 (148, b::allocate_upload_memory as usize),
