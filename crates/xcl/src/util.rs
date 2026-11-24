@@ -124,11 +124,15 @@ unsafe fn from_code_page_ptr(p: *const u8, code_page: u32) -> Option<String> {
 
 /// The process runs under Wine (its ntdll exports `wine_get_version`).
 pub fn under_wine() -> bool {
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
     static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // SAFETY: ntdll is always loaded; both names are NUL-terminated.
     *WINE.get_or_init(|| unsafe {
-        GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8), c"wine_get_version".as_ptr() as *const u8).is_some()
+        let err = GetLastError();
+        let is_wine = GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8), c"wine_get_version".as_ptr() as *const u8).is_some();
+        SetLastError(err);
+        is_wine
     })
 }
 

@@ -39,10 +39,15 @@ const IID_PIPELINE_STATE: GUID = GUID::from_u128(0x765a30f3_f624_4c6f_a828_ace94
 /// IID of ID3D12ShaderCacheSession and ID3D12ShaderCacheSession1
 pub const IID_SHADER_CACHE_SESSION: GUID = GUID::from_u128(0x28e2495d_0f64_4ae4_a6ec_129255dc49a8);
 pub const IID_SHADER_CACHE_SESSION1: GUID = GUID::from_u128(0x1c5789ff_9203_490f_b971_984acf1eb5fe);
+const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
+const IID_DEVICE_CHILD: GUID = GUID::from_u128(0x905db94b_a00c_4140_9df5_2b64ca9ea357);
 
 pub fn is_shader_cache_session_guid(g: &GUID) -> bool {
-    guid_bytes(g) == guid_bytes(&IID_SHADER_CACHE_SESSION)
-        || guid_bytes(g) == guid_bytes(&IID_SHADER_CACHE_SESSION1)
+    let b = guid_bytes(g);
+    b == guid_bytes(&IID_SHADER_CACHE_SESSION)
+        || b == guid_bytes(&IID_SHADER_CACHE_SESSION1)
+        || b == guid_bytes(&IID_IUNKNOWN)
+        || b == guid_bytes(&IID_DEVICE_CHILD)
 }
 /// D3D12_INDIRECT_ARGUMENT_TYPE of the console's DispatchX
 const XBOX_ARG_DISPATCH_X: u32 = 105;
