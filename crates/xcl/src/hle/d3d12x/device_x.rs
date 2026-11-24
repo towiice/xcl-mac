@@ -36,6 +36,14 @@ pub const XBOX_TYPE_DMA: u32 = 0x10;
 const IID_XBOX_DMA_COMMAND_LIST: GUID = GUID::from_u128(0x30bc77b9_8379_4b25_95de_b8588c42275d);
 const IID_GRAPHICS_COMMAND_LIST: GUID = GUID::from_u128(0x5b160d0f_ac1b_4185_8ba8_b3ae42a5a455);
 const IID_PIPELINE_STATE: GUID = GUID::from_u128(0x765a30f3_f624_4c6f_a828_ace948622445);
+/// IID of ID3D12ShaderCacheSession and ID3D12ShaderCacheSession1
+pub const IID_SHADER_CACHE_SESSION: GUID = GUID::from_u128(0x28e2495d_0f64_4ae4_a6ec_129255dc49a8);
+pub const IID_SHADER_CACHE_SESSION1: GUID = GUID::from_u128(0x1c5789ff_9203_490f_b971_984acf1eb5fe);
+
+pub fn is_shader_cache_session_guid(g: &GUID) -> bool {
+    guid_bytes(g) == guid_bytes(&IID_SHADER_CACHE_SESSION)
+        || guid_bytes(g) == guid_bytes(&IID_SHADER_CACHE_SESSION1)
+}
 /// D3D12_INDIRECT_ARGUMENT_TYPE of the console's DispatchX
 const XBOX_ARG_DISPATCH_X: u32 = 105;
 
@@ -126,8 +134,36 @@ pub(super) unsafe extern "system" fn create_command_list_pc(this: *mut c_void, n
 /// device #73 CreateCommandListX(params { type @0; node mask @8 }, allocator, initial
 /// pipeline, riid, list)
 pub(super) unsafe extern "system" fn create_command_list_x(this: *mut c_void, params: *const u32, alloc: usize, pso: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    // If slot 73 is called on ID3D12Device9 as CreateShaderCacheSession (e.g. Scarlett master title GTA VI),
+    // argument 3 (`alloc`) carries `riid: *const GUID` and argument 4 (`pso`) carries `ppv: *mut *mut c_void`.
+    if alloc != 0 && crate::gpu::shader::readable(alloc, std::mem::size_of::<GUID>()) {
+        let candidate = &*(alloc as *const GUID);
+        if is_shader_cache_session_guid(candidate) {
+            return create_shader_cache_session_x(this, params as *const c_void, alloc as *const GUID, pso as *mut *mut c_void);
+        }
+    }
     let (ty, node) = if params.is_null() { (0, 1) } else { (params.read_unaligned(), params.add(2).read_unaligned()) };
     create_list(this, node, ty, alloc, pso, riid, ppv)
+}
+
+/// device #73 CreateShaderCacheSession (PC path / ID3D12Device9)
+pub(super) unsafe extern "system" fn create_shader_cache_session_pc(
+    this: *mut c_void,
+    desc: *const c_void,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    real::dev_create_shader_cache_session(this, desc, riid, ppv)
+}
+
+/// device #73 CreateShaderCacheSessionX / CreateShaderCacheSession (console path)
+pub(super) unsafe extern "system" fn create_shader_cache_session_x(
+    this: *mut c_void,
+    desc: *const c_void,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    create_shader_cache_session_pc(this, desc, riid, ppv)
 }
 
 /// device #60 CreateGraphicsPipelineStateX(desc, extension count, extensions, riid, pipeline):
@@ -1273,5 +1309,13 @@ mod tests {
             assert_eq!(unregister_page_pool_x(std::ptr::null_mut(), i as u64), S_OK);
             assert_eq!(unregister_page_pool_x(std::ptr::null_mut(), i as u64), E_FAIL);
         }
+    }
+
+    #[test]
+    fn shader_cache_session_guid_identification() {
+        assert!(is_shader_cache_session_guid(&IID_SHADER_CACHE_SESSION));
+        assert!(is_shader_cache_session_guid(&IID_SHADER_CACHE_SESSION1));
+        assert!(!is_shader_cache_session_guid(&IID_XBOX_DMA_COMMAND_LIST));
+        assert!(!is_shader_cache_session_guid(&IID_GRAPHICS_COMMAND_LIST));
     }
 }
