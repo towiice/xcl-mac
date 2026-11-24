@@ -125,6 +125,16 @@ check "Two-pass DispatchMesh & ExecuteIndirect execution harness" \
 check "Mac cross-build CI workflow (.github/workflows/mac-cross.yml)" \
     "test -f .github/workflows/mac-cross.yml && grep -q 'x86_64-pc-windows-gnullvm' .github/workflows/mac-cross.yml"
 
+# 9. Verification Parity & Memory Safety (R6 Hardening)
+check "CreateShaderCacheSession translation layer fallback" \
+    "grep -q 'CreateShaderCacheSession' crates/xcl/src/hle/d3d12_layout.rs && grep -q 'ID3D12ShaderCacheSession' crates/xcl/src/hle/d3d12_layout.rs"
+
+check "Pointer alignment guard in is_adopted (align_of::<usize>)" \
+    "grep -q 'align_of::<usize>() - 1' crates/xcl/src/hle/d3d12x/real.rs && grep -q 'misaligned_return_buffer_is_not_adopted' crates/xcl/src/hle/d3d12x/real.rs"
+
+check "Heap mirroring and bounded root SRVs" \
+    "grep -q 'mirrors::source' crates/xcl/src/hle/kernelx.rs && grep -q 'indirect::source' crates/xcl/src/hle/d3d12x/bind.rs && grep -q 'offset & !15' crates/xcl/src/hle/d3d12x/indirect.rs"
+
 echo "======================================================================"
 echo "Verification Summary: $PASS Passed, $FAIL Failed"
 echo "======================================================================"

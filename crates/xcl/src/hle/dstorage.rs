@@ -125,10 +125,20 @@ fn warn_once(what: &str, why: std::fmt::Arguments) {
 // ---------------------------------------------------------------------------------------
 
 /// `DSTORAGE_BCPACK_MODE` names (GDK `dstorage_xs.h`); 8..=15 are not in the enum.
+const BCPACK_NAMES_ALL: [&str; 16] = [
+    "none", "BC1", "BC2", "BC3", "BC4", "BC5", "BC6H", "BC7",
+    "mode 8", "mode 9", "mode 10", "mode 11", "mode 12", "mode 13", "mode 14", "mode 15",
+];
+
 const BCPACK_NAMES: [&str; 8] = ["none", "BC1", "BC2", "BC3", "BC4", "BC5", "BC6H", "BC7"];
 
+#[inline(always)]
+fn bcpack_name_str(mode: u8) -> &'static str {
+    BCPACK_NAMES_ALL.get((mode & 0xF) as usize).copied().unwrap_or("unknown")
+}
+
 fn bcpack_name(mode: u8) -> String {
-    BCPACK_NAMES.get(mode as usize).map_or_else(|| format!("mode {mode}"), |n| n.to_string())
+    bcpack_name_str(mode).to_string()
 }
 
 /// BCPack requests refused at enqueue (XCL has no BCPack decoder), by mode.
@@ -207,7 +217,24 @@ pub fn stats() -> DStorageStats {
 /// the first 16 refusals and every power of two.
 fn log_bcpack_refusal(r: &Request, k: u64, fill: bool, accept: bool) {
     let bc = r.bcpack();
-    let key = format!("BCPack {}{}", bcpack_name(bc), if r.zlib() { " after zlib" } else { "" });
+    let key = match (r.zlib(), bc) {
+        (false, 1) => "BCPack BC1",
+        (false, 2) => "BCPack BC2",
+        (false, 3) => "BCPack BC3",
+        (false, 4) => "BCPack BC4",
+        (false, 5) => "BCPack BC5",
+        (false, 6) => "BCPack BC6H",
+        (false, 7) => "BCPack BC7",
+        (true, 1) => "BCPack BC1 after zlib",
+        (true, 2) => "BCPack BC2 after zlib",
+        (true, 3) => "BCPack BC3 after zlib",
+        (true, 4) => "BCPack BC4 after zlib",
+        (true, 5) => "BCPack BC5 after zlib",
+        (true, 6) => "BCPack BC6H after zlib",
+        (true, 7) => "BCPack BC7 after zlib",
+        (false, _) => "BCPack unknown",
+        (true, _) => "BCPack unknown after zlib",
+    };
     let action = if accept {
         "placeholder allowed: request succeeds only after a complete solid-block fill"
     } else if fill {
@@ -216,7 +243,7 @@ fn log_bcpack_refusal(r: &Request, k: u64, fill: bool, accept: bool) {
         "the request fails with E_DECOMPRESSION"
     };
     warn_once(
-        &key,
+        key,
         format_args!(
             "mode {bc} unsupported (src={}, intermediate={}, dst={}, swizzle={}); {action}",
             r.source_size,
@@ -265,47 +292,131 @@ const BC4_FULL: [u8; 8] = [0xFF, 0xFF, 0, 0, 0, 0, 0, 0];
 /// BC4 block: both endpoints 0.
 const BC4_ZERO: [u8; 8] = [0; 8];
 
-/// One solid block of `mode`'s BCn format.
-fn bcpack_fill_block(mode: u8) -> Option<Vec<u8>> {
-    let cat = |a: &[u8], b: &[u8]| [a, b].concat();
+const BC2_BLOCK: [u8; 16] = [
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0x1F, 0xF8, 0x1F, 0xF8, 0, 0, 0, 0,
+];
+const BC3_BLOCK: [u8; 16] = [
+    0xFF, 0xFF, 0, 0, 0, 0, 0, 0,
+    0x1F, 0xF8, 0x1F, 0xF8, 0, 0, 0, 0,
+];
+const BC5_BLOCK: [u8; 16] = [
+    0xFF, 0xFF, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+];
+// mode 11 (5 bits 00011): one region, 10-bit endpoints r/g/b = 495/0/495 (1.0 in UF16), indices 0
+const BC6H_BLOCK: [u8; 16] = (3u128 | 495 << 5 | 495 << 25 | 495 << 35 | 495 << 55).to_le_bytes();
+// mode 6 (bit 6): 7-bit endpoints r/g/b/a = 127/0/127/127, both p-bits 1, indices 0
+const BC7_BLOCK: [u8; 16] = (1u128 << 6 | 127 << 7 | 127 << 14 | 127 << 35 | 127 << 42 | 127 << 49 | 127 << 56 | 1 << 63 | 1 << 64).to_le_bytes();
+
+const CHUNK: usize = 4096;
+const CHUNK_PADDED: usize = CHUNK + 16;
+
+const fn make_chunk_8(block: &[u8; 8]) -> [u8; CHUNK_PADDED] {
+    let mut buf = [0u8; CHUNK_PADDED];
+    let mut i = 0;
+    while i < CHUNK_PADDED {
+        buf[i] = block[i % 8];
+        i += 1;
+    }
+    buf
+}
+
+const fn make_chunk_16(block: &[u8; 16]) -> [u8; CHUNK_PADDED] {
+    let mut buf = [0u8; CHUNK_PADDED];
+    let mut i = 0;
+    while i < CHUNK_PADDED {
+        buf[i] = block[i % 16];
+        i += 1;
+    }
+    buf
+}
+
+static BC1_CHUNK: [u8; CHUNK_PADDED] = make_chunk_8(&BC1_MAGENTA);
+static BC2_CHUNK: [u8; CHUNK_PADDED] = make_chunk_16(&BC2_BLOCK);
+static BC3_CHUNK: [u8; CHUNK_PADDED] = make_chunk_16(&BC3_BLOCK);
+static BC4_CHUNK: [u8; CHUNK_PADDED] = make_chunk_8(&BC4_FULL);
+static BC5_CHUNK: [u8; CHUNK_PADDED] = make_chunk_16(&BC5_BLOCK);
+static BC6H_CHUNK: [u8; CHUNK_PADDED] = make_chunk_16(&BC6H_BLOCK);
+static BC7_CHUNK: [u8; CHUNK_PADDED] = make_chunk_16(&BC7_BLOCK);
+
+#[inline(always)]
+fn bcpack_fill_chunk(mode: u8) -> Option<(&'static [u8; CHUNK_PADDED], usize)> {
     Some(match mode {
-        1 => BC1_MAGENTA.to_vec(),
-        2 => cat(&[0xFF; 8], &BC1_MAGENTA),
-        3 => cat(&BC4_FULL, &BC1_MAGENTA),
-        4 => BC4_FULL.to_vec(),
-        5 => cat(&BC4_FULL, &BC4_ZERO),
-        // mode 11 (5 bits 00011): one region, 10-bit endpoints r/g/b = 495/0/495 (1.0 in UF16), indices 0
-        6 => (3u128 | 495 << 5 | 495 << 25 | 495 << 35 | 495 << 55).to_le_bytes().to_vec(),
-        // mode 6 (bit 6): 7-bit endpoints r/g/b/a = 127/0/127/127, both p-bits 1, indices 0
-        7 => (1u128 << 6 | 127 << 7 | 127 << 14 | 127 << 35 | 127 << 42 | 127 << 49 | 127 << 56 | 1 << 63 | 1 << 64)
-            .to_le_bytes()
-            .to_vec(),
+        1 => (&BC1_CHUNK, 8),
+        2 => (&BC2_CHUNK, 16),
+        3 => (&BC3_CHUNK, 16),
+        4 => (&BC4_CHUNK, 8),
+        5 => (&BC5_CHUNK, 16),
+        6 => (&BC6H_CHUNK, 16),
+        7 => (&BC7_CHUNK, 16),
         _ => return None,
     })
+}
+
+#[inline(always)]
+fn bcpack_fill_block_slice(mode: u8) -> Option<&'static [u8]> {
+    Some(match mode {
+        1 => &BC1_MAGENTA,
+        2 => &BC2_BLOCK,
+        3 => &BC3_BLOCK,
+        4 => &BC4_FULL,
+        5 => &BC5_BLOCK,
+        6 => &BC6H_BLOCK,
+        7 => &BC7_BLOCK,
+        _ => return None,
+    })
+}
+
+/// One solid block of `mode`'s BCn format.
+fn bcpack_fill_block(mode: u8) -> Option<Vec<u8>> {
+    bcpack_fill_block_slice(mode).map(|s| s.to_vec())
+}
+
+const INLINE_PAGES: usize = 32;
+
+#[derive(Clone, Debug)]
+enum PageList {
+    Inline { pages: [usize; INLINE_PAGES], count: usize },
+    Heap(Vec<usize>),
+}
+
+impl PageList {
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            Self::Inline { pages, count } => &pages[..*count],
+            Self::Heap(vec) => vec.as_slice(),
+        }
+    }
+
+    fn to_vec(&self) -> Vec<usize> {
+        self.as_slice().to_vec()
+    }
+}
+
+impl std::ops::Deref for PageList {
+    type Target = [usize];
+    fn deref(&self) -> &[usize] {
+        self.as_slice()
+    }
 }
 
 /// Where a refused BCPack request's fill goes: its virtual destination, or the physical pages
 /// it named (snapshot at enqueue, as for a request that runs).
 enum FillTarget {
     Virtual,
-    Pages(Vec<usize>),
+    Pages(PageList),
 }
 
 /// Fill the title's destination of `r` (exactly `destination_size` bytes) with solid blocks.
 unsafe fn bcpack_fill(r: &Request, target: &FillTarget) -> bool {
-    let Some(block) = bcpack_fill_block(r.bcpack()) else { return false };
+    let Some((chunk_pattern, block_len)) = bcpack_fill_chunk(r.bcpack()) else { return false };
     let n = r.destination_size as usize;
-    // Keep staging bounded even when a request spans many pages. The extra block
-    // lets a physical page continue the pattern at any byte offset.
-    const CHUNK: usize = 4096;
-    let mut bytes = [0u8; CHUNK + 16];
-    for (byte, value) in bytes.iter_mut().zip(block.iter().copied().cycle()) {
-        *byte = value;
-    }
     let write = |dst: *mut u8, completed: usize, len: usize| {
-        let phase = completed % block.len();
+        let phase = completed % block_len;
+        let src_ptr = chunk_pattern.as_ptr().add(phase);
         for offset in (0..len).step_by(CHUNK) {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr().add(phase), dst.add(offset), CHUNK.min(len - offset));
+            std::ptr::copy_nonoverlapping(src_ptr, dst.add(offset), CHUNK.min(len - offset));
         }
     };
     let ok = match target {
@@ -733,9 +844,9 @@ impl Request {
 }
 
 /// Snapshot a `PULONG_PTR` physical page array at enqueue time (callers often stack-allocate it).
-unsafe fn snapshot_page_array(ptr: u64, offset: u16, byte_len: u32) -> Result<Vec<usize>, HRESULT> {
+unsafe fn snapshot_page_list(ptr: u64, offset: u16, byte_len: u32) -> Result<PageList, HRESULT> {
     if byte_len == 0 {
-        return Ok(Vec::new());
+        return Ok(PageList::Inline { pages: [0; INLINE_PAGES], count: 0 });
     }
     let Some(span) = (offset as usize).checked_add(byte_len as usize) else {
         return Err(E_DESTINATION_SIZE);
@@ -744,11 +855,23 @@ unsafe fn snapshot_page_array(ptr: u64, offset: u16, byte_len: u32) -> Result<Ve
     let Some(bytes) = count.checked_mul(std::mem::size_of::<usize>()) else {
         return Err(E_ACCESS_VIOLATION);
     };
-    let mut pages = vec![0usize; count];
-    if !read_own(ptr as usize, pages.as_mut_ptr() as *mut u8, bytes) {
-        return Err(E_ACCESS_VIOLATION);
+    if count <= INLINE_PAGES {
+        let mut pages = [0usize; INLINE_PAGES];
+        if !read_own(ptr as usize, pages.as_mut_ptr() as *mut u8, bytes) {
+            return Err(E_ACCESS_VIOLATION);
+        }
+        Ok(PageList::Inline { pages, count })
+    } else {
+        let mut pages = vec![0usize; count];
+        if !read_own(ptr as usize, pages.as_mut_ptr() as *mut u8, bytes) {
+            return Err(E_ACCESS_VIOLATION);
+        }
+        Ok(PageList::Heap(pages))
     }
-    Ok(pages)
+}
+
+unsafe fn snapshot_page_array(ptr: u64, offset: u16, byte_len: u32) -> Result<Vec<usize>, HRESULT> {
+    snapshot_page_list(ptr, offset, byte_len).map(|l| l.to_vec())
 }
 
 unsafe fn read_own(at: usize, out: *mut u8, len: usize) -> bool {
@@ -1308,7 +1431,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
                 fill = if !r.dest_physical_pages() {
                     Some(FillTarget::Virtual)
                 } else {
-                    snapshot_page_array(r.destination, r.destination_page_offset, r.destination_size).ok().map(FillTarget::Pages)
+                    snapshot_page_list(r.destination, r.destination_page_offset, r.destination_size).ok().map(FillTarget::Pages)
                 };
             }
         }
