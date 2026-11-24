@@ -277,7 +277,14 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
 pub fn unregister(obj: usize) {
     let gone = {
         let mut heaps = HEAPS.lock().unwrap();
-        heaps.iter().position(|h| h.obj == obj).map(|i| heaps.swap_remove(i))
+        heaps.iter().position(|h| h.obj == obj).map(|i| {
+            if crate::util::mac_host() {
+                if let Some(tags) = LAST_TAGS.lock().unwrap().as_mut() {
+                    tags.retain(|(heap, _), _| *heap != obj);
+                }
+            }
+            heaps.swap_remove(i)
+        })
     };
     if let Some(h) = gone {
         for (p, &f) in h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED) {
@@ -293,11 +300,6 @@ pub fn unregister(obj: usize) {
                 }
             }
             Memory::Title => unsafe { crate::hle::kernelx::runtime_free(h.shadow, crate::hle::kernelx::D3D_DESCRIPTOR_HEAP) },
-        }
-        if let Ok(mut tags) = LAST_TAGS.lock() {
-            if let Some(m) = tags.as_mut() {
-                m.retain(|&(o, _), _| o != obj);
-            }
         }
     }
 }
@@ -490,7 +492,26 @@ pub fn words_at(addr32: u32) -> Option<[u32; 8]> {
     Some(w)
 }
 
-static LAST_TAGS: Mutex<Option<HashMap<(usize, u32), (u64, u32)>>> = Mutex::new(None);
+static LAST_TAGS: Mutex<Option<HashMap<(usize, u32), u64>>> = Mutex::new(None);
+
+/// Find the CPU-only mirror of a global SRV. D3D12 cannot copy descriptors from
+/// the shader-visible global heap, even if its CPU handle is available.
+fn cpu_mirror_srv(heaps: &[Heap], index: u32) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    for h in heaps.iter().filter(|h| h.pc_gpu == 0) {
+        for (page, &first) in h.pages.iter().enumerate() {
+            let page = page as u32;
+            if first == UNMAPPED || index < first {
+                continue;
+            }
+            let offset = index - first;
+            if offset % 2 == 0 && offset < page_descriptors(h.n, page) {
+                let slot = page * PAGE_SLOTS + offset / 2;
+                return Some(D3D12_CPU_DESCRIPTOR_HANDLE { ptr: h.pc_cpu as usize + 2 * slot as usize * h.inc as usize });
+            }
+        }
+    }
+    None
+}
 
 /// Brings the host descriptor heap (`GLOBAL`) up to date with descriptors the title wrote into
 /// heap memory itself (copies of whole slots or converting image slots to buffers/CBVs/zeroes),
@@ -507,7 +528,11 @@ static LAST_TAGS: Mutex<Option<HashMap<(usize, u32), (u64, u32)>>> = Mutex::new(
 /// submission is mirrored: slots converted to buffers/CBVs or zeroed are populated with a null
 /// raw buffer SRV returning zeros on out-of-bounds reads, while image views copied from other slots
 /// are mirrored to their destination descriptor in `GLOBAL`.
-pub unsafe fn resync_title_writes(_queue: *mut std::ffi::c_void) {
+pub unsafe fn resync_title_writes() {
+    use std::ffi::c_void;
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
     let heaps = HEAPS.lock().unwrap();
     let g = GLOBAL.lock().unwrap();
     let Some(g) = g.as_ref() else { return };
@@ -515,6 +540,8 @@ pub unsafe fn resync_title_writes(_queue: *mut std::ffi::c_void) {
     let mut tags_lock = LAST_TAGS.lock().unwrap();
     let tags = tags_lock.get_or_insert_with(HashMap::new);
 
+    let process = GetCurrentProcess();
+    let mut snapshot = [[0u32; 8]; PAGE_SLOTS as usize];
     for h in heaps.iter().filter(|h| h.visible && !h.sampler) {
         if h.shadow == 0 {
             continue;
@@ -525,15 +552,26 @@ pub unsafe fn resync_title_writes(_queue: *mut std::ffi::c_void) {
             }
             let k_start = p as u32 * PAGE_SLOTS;
             let k_end = (k_start + PAGE_SLOTS).min(h.n);
-            for k in k_start..k_end {
-                let slot_va = h.shadow + (k * SLOT) as usize;
-                let w = std::slice::from_raw_parts(slot_va as *const u32, 8);
+            let count = (k_end - k_start) as usize;
+            if count == 0 {
+                continue;
+            }
+            let address = h.shadow + k_start as usize * SLOT as usize;
+            let bytes = count * SLOT as usize;
+            let mut copied = 0;
+            // The title owns some heap allocations and can decommit their backing memory.
+            if ReadProcessMemory(process, address as *const c_void, snapshot.as_mut_ptr().cast(), bytes, &mut copied) == 0
+                || copied != bytes
+            {
+                continue;
+            }
+
+            for (offset, w) in snapshot[..count].iter().enumerate() {
+                let k = k_start + offset as u32;
                 let tag = ((w[3] as u64) << 32) | (w[0] as u64);
-                let own_idx = first + 2 * (k - k_start);
-                if let Some(&(prev_tag, _)) = tags.get(&(h.obj, k)) {
-                    if prev_tag == tag {
-                        continue;
-                    }
+                let own_idx = first + 2 * offset as u32;
+                if tags.get(&(h.obj, k)) == Some(&tag) {
+                    continue;
                 }
 
                 let dst_cpu = g.cpu + (own_idx as u64) * (g.inc as u64);
@@ -554,20 +592,16 @@ pub unsafe fn resync_title_writes(_queue: *mut std::ffi::c_void) {
                         },
                     };
                     g.dev.CreateShaderResourceView(None, Some(&null_desc), D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dst_cpu as usize });
-                } else if w[3] >> 28 >= 8 && w[0] != own_idx {
-                    // Copied whole slot from another slot index in GLOBAL: mirror source descriptor
-                    let src_idx = w[0];
-                    if src_idx < g.cap {
-                        let src_cpu = g.cpu + (src_idx as u64) * (g.inc as u64);
-                        g.dev.CopyDescriptorsSimple(
-                            1,
-                            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dst_cpu as usize },
-                            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src_cpu as usize },
-                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                        );
-                    }
+                } else if w[0] != own_idx {
+                    let Some(src_cpu) = cpu_mirror_srv(&heaps, w[0]) else { continue };
+                    g.dev.CopyDescriptorsSimple(
+                        1,
+                        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dst_cpu as usize },
+                        src_cpu,
+                        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    );
                 }
-                tags.insert((h.obj, k), (tag, w[0]));
+                tags.insert((h.obj, k), tag);
             }
         }
     }
@@ -576,6 +610,27 @@ pub unsafe fn resync_title_writes(_queue: *mut std::ffi::c_void) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_srv_resolves_only_to_a_live_cpu_mirror() {
+        let heap = Heap {
+            obj: 1,
+            shadow: 0,
+            n: PAGE_SLOTS + 4,
+            pc_cpu: 0x1000,
+            pc_gpu: 0,
+            inc: 32,
+            sampler: false,
+            pages: vec![UNMAPPED, 64],
+            visible: true,
+            memory: Memory::Title,
+        };
+        let heaps = [heap];
+        assert_eq!(cpu_mirror_srv(&heaps, 68).unwrap().ptr, 0x1000 + 2 * (PAGE_SLOTS as usize + 2) * 32);
+        assert!(cpu_mirror_srv(&heaps, 69).is_none()); // UAV
+        assert!(cpu_mirror_srv(&heaps, 72).is_none()); // past the last partial page
+        assert!(cpu_mirror_srv(&heaps, 0).is_none()); // no assigned page
+    }
 
     /// Ranges of the shared heap: released ones first (first fit, split), then new ones, and
     /// none past its size.

@@ -144,29 +144,38 @@ pub fn under_wine() -> bool {
 /// may fault: write-watched or lazily committed memory), and every exception is slow.
 /// Under Wine, `XCL_MAC_HOST=1` / `0` overrides the detection.
 pub fn mac_host() -> bool {
-    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
     static MAC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *MAC.get_or_init(|| {
-        match std::env::var("XCL_MAC_HOST").as_deref().map(str::trim) {
-            Ok("1") => return true,
-            Ok("0") => return false,
-            _ => {}
-        }
-        if rosetta() {
-            return true;
-        }
-        if !under_wine() {
-            return false;
-        }
-        // SAFETY: ntdll is always loaded; Wine's export fills two pointers to static strings.
-        unsafe {
-            let Some(f) = GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8), c"wine_get_host_version".as_ptr() as *const u8) else { return false };
-            let f: unsafe extern "C" fn(*mut *const u8, *mut *const u8) = std::mem::transmute(f);
-            let (mut sysname, mut release) = (std::ptr::null(), std::ptr::null());
-            f(&mut sysname, &mut release);
-            from_cstr_ptr(sysname).is_some_and(|s| s.eq_ignore_ascii_case("Darwin"))
-        }
+    *MAC.get_or_init(|| unsafe {
+        let err = GetLastError();
+        let detected = detect_mac_host();
+        SetLastError(err);
+        detected
     })
+}
+
+fn detect_mac_host() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    let translated = rosetta();
+    if !translated && !under_wine() {
+        return false;
+    }
+    match std::env::var("XCL_MAC_HOST").as_deref().map(str::trim) {
+        Ok("1") => return true,
+        Ok("0") => return false,
+        _ => {}
+    }
+    if translated {
+        return true;
+    }
+    // SAFETY: ntdll is always loaded; Wine's export fills two pointers to static strings.
+    unsafe {
+        let Some(f) = GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8), c"wine_get_host_version".as_ptr() as *const u8) else { return false };
+        let f: unsafe extern "C" fn(*mut *const u8, *mut *const u8) = std::mem::transmute(f);
+        let (mut sysname, mut release) = (std::ptr::null(), std::ptr::null());
+        f(&mut sysname, &mut release);
+        from_cstr_ptr(sysname).is_some_and(|s| s.eq_ignore_ascii_case("Darwin"))
+    }
 }
 
 /// The title's code is run by Rosetta 2 rather than by a CPU: the translator says so in the

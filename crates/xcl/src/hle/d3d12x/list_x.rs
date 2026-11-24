@@ -3324,15 +3324,17 @@ const PC_IA_SET_VERTEX_BUFFERS: usize = 44;
 /// the title's (its memory: the GPU address of that memory for the PC)
 pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, start: u32, n: u32, views: *const D3D12_VERTEX_BUFFER_VIEW) {
     let f = pc::<unsafe extern "system" fn(*mut c_void, u32, u32, *const D3D12_VERTEX_BUFFER_VIEW)>(this, PC_IA_SET_VERTEX_BUFFERS);
-    if views.is_null() || n == 0 {
-        if views.is_null() && n != 0 {
-            with_bindings(this, |b| {
-                for slot in start..start + n {
-                    b.vertex_buffers.remove(&slot);
-                    b.vertex_titles.remove(&slot);
-                }
-            });
-        }
+    if n == 0 {
+        return f(this, start, n, views);
+    }
+    let Some(end) = start.checked_add(n).filter(|&end| end <= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) else { return };
+    if views.is_null() {
+        with_bindings(this, |b| {
+            for slot in start..end {
+                b.vertex_buffers.remove(&slot);
+                b.vertex_titles.remove(&slot);
+            }
+        });
         return f(this, start, n, views);
     }
     let v: Vec<D3D12_VERTEX_BUFFER_VIEW> = (0..n as usize)

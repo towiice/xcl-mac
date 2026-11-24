@@ -1070,8 +1070,8 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (67, x::deserialize_pso_x as usize),
                 (70, dev_create_srv_at_x as usize),
                 (71, dev_create_uav_at_x as usize),
-                if crate::util::mac_host() || crate::util::rosetta() { (73, dev_create_shader_cache_session as usize) } else { (73, x::create_command_list_x as usize) },
-                if crate::util::mac_host() || crate::util::rosetta() { (74, dev_shader_cache_control as usize) } else { (74, x::register_page_pool_x as usize) },
+                (73, x::create_command_list_x as usize),
+                (74, x::register_page_pool_x as usize),
                 (75, x::unregister_page_pool_x as usize),
                 (76, dev_create_committed_resource_x as usize),
                 // frame pacing (SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX,
@@ -3358,15 +3358,27 @@ creator!(dev_create_state_object, "CreateStateObject", Kind::StateObject, [a1]);
 struct DummyShaderCacheSession {
     vtbl: *const usize,
     refs: AtomicU32,
-    device: *mut c_void,
-    desc: [u8; 48],
+    device: Option<ID3D12Device>,
+    desc: D3D12_SHADER_CACHE_SESSION_DESC,
 }
 
-unsafe extern "system" fn session_qi(this: *mut DummyShaderCacheSession, _riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+static DUMMY_SESSIONS: Mutex<BTreeSet<usize>> = Mutex::new(BTreeSet::new());
+const CACHE_MISS: HRESULT = DXGI_ERROR_NOT_FOUND.0;
+
+unsafe extern "system" fn session_qi(this: *mut DummyShaderCacheSession, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     if ppv.is_null() {
         return E_INVALIDARG;
     }
-    (*this).refs.fetch_add(1, Ordering::AcqRel);
+    *ppv = std::ptr::null_mut();
+    if riid.is_null() {
+        return E_INVALIDARG;
+    }
+    let iid = riid.read_unaligned();
+    let iid_value = windows::core::GUID::from_values(iid.data1, iid.data2, iid.data3, iid.data4);
+    if !super::device_x::is_shader_cache_session_guid(&iid) && iid_value != ID3D12Object::IID {
+        return E_NOINTERFACE;
+    }
+    session_add_ref(this);
     *ppv = this as *mut c_void;
     S_OK
 }
@@ -3376,7 +3388,12 @@ unsafe extern "system" fn session_add_ref(this: *mut DummyShaderCacheSession) ->
 }
 
 unsafe extern "system" fn session_release(this: *mut DummyShaderCacheSession) -> u32 {
-    (*this).refs.fetch_sub(1, Ordering::AcqRel).saturating_sub(1)
+    let remaining = (*this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+    if remaining == 0 {
+        DUMMY_SESSIONS.lock().unwrap().remove(&(this as usize));
+        drop(Box::from_raw(this));
+    }
+    remaining
 }
 
 unsafe extern "system" fn session_get_private_data(_this: *mut DummyShaderCacheSession, _guid: *const GUID, size: *mut u32, _data: *mut c_void) -> HRESULT {
@@ -3402,25 +3419,18 @@ unsafe extern "system" fn session_get_device(this: *mut DummyShaderCacheSession,
     if ppv.is_null() {
         return E_INVALIDARG;
     }
-    let dev = (*this).device;
-    if dev.is_null() {
-        *ppv = std::ptr::null_mut();
-        return E_FAIL;
+    *ppv = std::ptr::null_mut();
+    if riid.is_null() {
+        return E_INVALIDARG;
     }
-    if !riid.is_null() && crate::gpu::shader::readable(dev as usize, 8) {
-        let vt_ptr = *(dev as *const *const usize);
-        if !vt_ptr.is_null() && crate::gpu::shader::readable(vt_ptr as usize, 8) {
-            let qi: QiFn = std::mem::transmute(*vt_ptr);
-            return qi(dev, riid, ppv);
-        }
-    }
-    *ppv = dev;
-    S_OK
+    let Some(dev) = (*this).device.as_ref() else { return E_FAIL };
+    let raw = dev.as_raw();
+    let qi: QiFn = std::mem::transmute(*vt(raw));
+    qi(raw, riid, ppv)
 }
 
 unsafe extern "system" fn session_find_value(_this: *mut DummyShaderCacheSession, _key: *const c_void, _key_size: u32, _val: *mut c_void, _val_size: *mut u32) -> HRESULT {
-    // D3D12_ERROR_ADAPTER_NOT_FOUND indicates cache miss so caller compiles the shader normally
-    0x887E_0001u32 as i32
+    CACHE_MISS
 }
 
 unsafe extern "system" fn session_store_value(_this: *mut DummyShaderCacheSession, _key: *const c_void, _key_size: u32, _val: *const c_void, _val_size: u32) -> HRESULT {
@@ -3429,40 +3439,53 @@ unsafe extern "system" fn session_store_value(_this: *mut DummyShaderCacheSessio
 
 unsafe extern "system" fn session_set_delete_on_destroy(_this: *mut DummyShaderCacheSession) {}
 
-unsafe extern "system" fn session_get_desc(a: *mut c_void, b: *mut c_void) -> *mut c_void {
-    let table = dummy_session_vtable();
-    let (this, ret) = if !a.is_null() && *(a as *const usize) == table as usize {
-        (a as *mut DummyShaderCacheSession, b as *mut u8)
-    } else if !b.is_null() && *(b as *const usize) == table as usize {
-        (b as *mut DummyShaderCacheSession, a as *mut u8)
-    } else if !a.is_null() {
-        (a as *mut DummyShaderCacheSession, std::ptr::null_mut())
-    } else {
-        (b as *mut DummyShaderCacheSession, std::ptr::null_mut())
+unsafe extern "system" fn session_get_desc(
+    a: *mut c_void,
+    b: *mut c_void,
+) -> *mut D3D12_SHADER_CACHE_SESSION_DESC {
+    // Some title calls put the return buffer first. Identify the live session without
+    // reading the result buffer, which the caller may have left uninitialized.
+    let (this, out) = {
+        let sessions = DUMMY_SESSIONS.lock().unwrap();
+        match (sessions.contains(&(a as usize)), sessions.contains(&(b as usize))) {
+            (true, false) => (a, b),
+            (false, true) => (b, a),
+            _ => return std::ptr::null_mut(),
+        }
     };
-
-    if !this.is_null() && !ret.is_null() {
-        std::ptr::copy_nonoverlapping((*this).desc.as_ptr(), ret, 48);
+    let out = out.cast::<D3D12_SHADER_CACHE_SESSION_DESC>();
+    if !out.is_null() {
+        out.write_unaligned((*this.cast::<DummyShaderCacheSession>()).desc);
     }
-    ret as *mut c_void
+    out
 }
 
 unsafe extern "system" fn session_find_value1(_this: *mut DummyShaderCacheSession, _a1: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize) -> HRESULT {
-    0x887E_0001u32 as i32
+    CACHE_MISS
 }
 
-unsafe extern "system" fn session_store_value1(_this: *mut DummyShaderCacheSession, _a1: usize, _a2: usize, _a3: usize, _a4: usize, _a5: usize) -> HRESULT {
+unsafe extern "system" fn session_store_value1(_this: *mut DummyShaderCacheSession, _key: *const c_void, _values: *const c_void, _count: u32, _flags: u32) -> HRESULT {
     S_OK
 }
 
-unsafe extern "system" fn session_get_session_info(_this: *mut DummyShaderCacheSession, info: *mut c_void) -> HRESULT {
-    if !info.is_null() {
-        std::ptr::write_bytes(info as *mut u8, 0, 32);
+#[repr(C)]
+struct ShaderCacheSessionInfo {
+    current_size_bytes: u64,
+    maximum_size_bytes: u64,
+    reserved_size_bytes: u64,
+    entry_count: u32,
+    lifetime_evicted_entry_count: u64,
+}
+
+unsafe extern "system" fn session_get_session_info(_this: *mut DummyShaderCacheSession, info: *mut ShaderCacheSessionInfo) -> HRESULT {
+    if info.is_null() {
+        return E_INVALIDARG;
     }
+    info.write_bytes(0, 1);
     S_OK
 }
 
-unsafe extern "system" fn session_trim_to(_this: *mut DummyShaderCacheSession, _size: u64) -> HRESULT {
+unsafe extern "system" fn session_trim_to(_this: *mut DummyShaderCacheSession, _size: u64, _flags: u32) -> HRESULT {
     S_OK
 }
 
@@ -3499,17 +3522,20 @@ fn dummy_session_vtable() -> *const usize {
 }
 
 pub(super) unsafe fn create_dummy_shader_cache_session(device: *mut c_void, desc: *const c_void) -> *mut c_void {
-    let mut desc_bytes = [0u8; 48];
-    if !desc.is_null() && crate::gpu::shader::readable(desc as usize, 48) {
-        std::ptr::copy_nonoverlapping(desc as *const u8, desc_bytes.as_mut_ptr(), 48);
-    }
+    let desc = if !desc.is_null() && crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_SHADER_CACHE_SESSION_DESC>()) {
+        desc.cast::<D3D12_SHADER_CACHE_SESSION_DESC>().read_unaligned()
+    } else {
+        D3D12_SHADER_CACHE_SESSION_DESC::default()
+    };
     let session = Box::new(DummyShaderCacheSession {
         vtbl: dummy_session_vtable(),
         refs: AtomicU32::new(1),
-        device,
-        desc: desc_bytes,
+        device: ID3D12Device::from_raw_borrowed(&device).cloned(),
+        desc,
     });
-    Box::into_raw(session) as *mut c_void
+    let raw = Box::into_raw(session);
+    DUMMY_SESSIONS.lock().unwrap().insert(raw as usize);
+    raw.cast()
 }
 
 pub(super) unsafe extern "system" fn dev_create_shader_cache_session(
@@ -3532,29 +3558,36 @@ pub(super) unsafe extern "system" fn dev_create_shader_cache_session(
         }
     }
 
-    if crate::util::mac_host() || crate::util::rosetta() || hr < 0 || hr == E_INVALIDARG || (*ppv).is_null() {
-        if hr < 0 || hr == E_INVALIDARG || (*ppv).is_null() {
-            static LOGGED: AtomicBool = AtomicBool::new(false);
-            if !LOGGED.swap(true, Ordering::Relaxed) {
-                crate::xlog_info!(
-                    "D3D12.X: ID3D12Device9::CreateShaderCacheSession host returned {:#x} - providing dummy shader cache session",
-                    hr as u32
-                );
-            }
-            *ppv = create_dummy_shader_cache_session(this, desc);
-            return S_OK;
+    if crate::util::mac_host() && (hr < 0 || (*ppv).is_null()) && !riid.is_null()
+        && super::device_x::is_shader_cache_session_guid(&riid.read_unaligned())
+    {
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            crate::xlog_info!(
+                "D3D12.X: ID3D12Device9::CreateShaderCacheSession host returned {:#x} - providing dummy shader cache session",
+                hr as u32
+            );
         }
+        *ppv = create_dummy_shader_cache_session(this, desc);
+        return S_OK;
     }
 
-    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+    if hr >= 0 && !(*ppv).is_null() {
         adopt(*ppv, Kind::ShaderCacheSession);
     }
 
     hr
 }
 
-pub(super) unsafe extern "system" fn dev_shader_cache_control(_this: *mut c_void, _kinds: u32, _control: u32) -> HRESULT {
-    S_OK
+pub(super) unsafe extern "system" fn dev_shader_cache_control(this: *mut c_void, kinds: u32, control: u32) -> HRESULT {
+    type F = unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT;
+    let hr = if let Some(slot) = try_slot_of(this, "ShaderCacheControl") {
+        let f: F = std::mem::transmute(orig_fn(this, slot));
+        f(this, kinds, control)
+    } else {
+        E_FAIL
+    };
+    if hr < 0 && crate::util::mac_host() { S_OK } else { hr }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -5656,7 +5689,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     // textures in title memory the CPU wrote since: uploaded again first
     super::title_textures::refresh(this);
     if crate::util::mac_host() {
-        super::console_heap::resync_title_writes(this);
+        super::console_heap::resync_title_writes();
     }
     // console-shaped lists run as the PC lists they were translated into (split title lists expand
     // into all of their recorded PC segments in exact chronological order)
@@ -6418,15 +6451,27 @@ mod console_format_query_tests {
             "Kind::Device must override CreateShaderCacheSession with dev_create_shader_cache_session"
         );
 
+        let slots = console_slots(Kind::Device);
+        assert!(slots.contains(&(73, super::super::device_x::create_command_list_x as usize)));
+        assert!(slots.contains(&(74, super::super::device_x::register_page_pool_x as usize)));
+
         unsafe {
-            let mut desc_bytes = [0x42u8; 48];
-            let dummy = create_dummy_shader_cache_session(std::ptr::null_mut(), desc_bytes.as_ptr() as *const c_void);
+            let desc = D3D12_SHADER_CACHE_SESSION_DESC {
+                MaximumInMemoryCacheEntries: 23,
+                Version: 42,
+                ..Default::default()
+            };
+            let desc_ptr = (&desc as *const D3D12_SHADER_CACHE_SESSION_DESC).cast();
+            let dummy = create_dummy_shader_cache_session(std::ptr::null_mut(), desc_ptr);
             assert!(!dummy.is_null());
 
             // 1. QueryInterface
             let mut out = std::ptr::null_mut();
             let qi: QiFn = std::mem::transmute(*(vt(dummy)));
-            assert_eq!(qi(dummy, &std::mem::zeroed(), &mut out), S_OK);
+            assert_eq!(qi(dummy, &std::mem::zeroed(), &mut out), E_NOINTERFACE);
+            assert!(out.is_null());
+            let iid = super::super::device_x::IID_SHADER_CACHE_SESSION;
+            assert_eq!(qi(dummy, &iid, &mut out), S_OK);
             assert_eq!(out, dummy);
 
             // 2. AddRef / Release
@@ -6435,30 +6480,34 @@ mod console_format_query_tests {
             assert_eq!(add_ref(dummy), 3);
             assert_eq!(release(dummy), 2);
 
-            // 3. FindValue (cache miss / 0x887E0001)
+            // 3. FindValue reports a cache miss.
             let find_value: unsafe extern "system" fn(*mut c_void, *const c_void, u32, *mut c_void, *mut u32) -> HRESULT =
                 std::mem::transmute(*vt(dummy).add(8));
-            assert_eq!(find_value(dummy, std::ptr::null(), 0, std::ptr::null_mut(), std::ptr::null_mut()), 0x887E_0001u32 as i32);
+            assert_eq!(find_value(dummy, std::ptr::null(), 0, std::ptr::null_mut(), std::ptr::null_mut()), CACHE_MISS);
 
             // 4. StoreValue (S_OK)
             let store_value: unsafe extern "system" fn(*mut c_void, *const c_void, u32, *const c_void, u32) -> HRESULT =
                 std::mem::transmute(*vt(dummy).add(9));
             assert_eq!(store_value(dummy, std::ptr::null(), 0, std::ptr::null(), 0), S_OK);
 
-            // 5. GetDesc (MSVC and C ABI)
-            let get_desc: unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void =
-                std::mem::transmute(*vt(dummy).add(11));
-            let mut read_desc = [0u8; 48];
-            let ret = get_desc(read_desc.as_mut_ptr() as *mut c_void, dummy);
-            assert_eq!(ret, read_desc.as_mut_ptr() as *mut c_void);
-            assert_eq!(read_desc, desc_bytes);
+            // 5. GetDesc uses the public D3D12 interface ABI.
+            let session = ID3D12ShaderCacheSession::from_raw_borrowed(&dummy).unwrap();
+            assert_eq!(session.GetDesc(), desc);
+            let mut result = std::mem::MaybeUninit::<D3D12_SHADER_CACHE_SESSION_DESC>::uninit();
+            let result_ptr = result.as_mut_ptr();
+            assert_eq!(session_get_desc(result_ptr.cast(), dummy), result_ptr);
+            assert_eq!(result.assume_init(), desc);
+            assert_eq!(release(dummy), 1);
+            assert_eq!(release(dummy), 0);
 
             // 6. dev_create_shader_cache_session under mac_host fallback
             let mut session_out = std::ptr::null_mut();
             if crate::util::mac_host() {
-                let hr = dev_create_shader_cache_session(std::ptr::null_mut(), desc_bytes.as_ptr() as *const c_void, std::ptr::null(), &mut session_out);
+                let iid = super::super::device_x::IID_SHADER_CACHE_SESSION;
+                let hr = dev_create_shader_cache_session(std::ptr::null_mut(), desc_ptr, &iid, &mut session_out);
                 assert_eq!(hr, S_OK);
                 assert!(!session_out.is_null());
+                assert_eq!(release(session_out), 0);
             }
         }
     }

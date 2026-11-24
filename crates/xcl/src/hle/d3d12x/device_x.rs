@@ -139,16 +139,13 @@ pub(super) unsafe extern "system" fn create_command_list_pc(this: *mut c_void, n
 /// device #73 CreateCommandListX(params { type @0; node mask @8 }, allocator, initial
 /// pipeline, riid, list)
 pub(super) unsafe extern "system" fn create_command_list_x(this: *mut c_void, params: *const u32, alloc: usize, pso: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    // If slot 73 is called on ID3D12Device9 as CreateShaderCacheSession (e.g. Scarlett master title GTA VI),
-    // argument 3 (`alloc`) carries `riid: *const GUID` and argument 4 (`pso`) carries `ppv: *mut *mut c_void`.
+    // This slot also receives PC cache-session calls from some titles. An allocator and
+    // a PSO are readable too, so require the cache call's IID before writing its output.
     if alloc != 0 && crate::gpu::shader::readable(alloc, std::mem::size_of::<GUID>()) {
-        let candidate = &*(alloc as *const GUID);
-        if is_shader_cache_session_guid(candidate) {
+        let candidate = (alloc as *const GUID).read_unaligned();
+        if is_shader_cache_session_guid(&candidate) {
             return create_shader_cache_session_x(this, params as *const c_void, alloc as *const GUID, pso as *mut *mut c_void);
         }
-    }
-    if (crate::util::mac_host() || crate::util::rosetta()) && pso != 0 && crate::gpu::shader::readable(pso, 8) {
-        return create_shader_cache_session_x(this, params as *const c_void, alloc as *const GUID, pso as *mut *mut c_void);
     }
     let (ty, node) = if params.is_null() { (0, 1) } else { (params.read_unaligned(), params.add(2).read_unaligned()) };
     create_list(this, node, ty, alloc, pso, riid, ppv)

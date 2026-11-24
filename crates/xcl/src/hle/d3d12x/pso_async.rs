@@ -44,8 +44,13 @@ impl Pending {
     }
 
     fn note_queued(&self) {
-        if self.queued.compare_exchange(STATE_IDLE, STATE_QUEUED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            BUILDING.fetch_add(1, Ordering::Relaxed);
+        if self.queued.load(Ordering::Relaxed) != STATE_IDLE {
+            return;
+        }
+        // Account for the job before a concurrent completion can see STATE_QUEUED.
+        BUILDING.fetch_add(1, Ordering::Relaxed);
+        if self.queued.compare_exchange(STATE_IDLE, STATE_QUEUED, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            BUILDING.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
