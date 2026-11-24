@@ -732,7 +732,7 @@ fn module_of(addr: usize) -> usize {
 
 /// Whether `obj` is an object XCL adopted (its vtable is one of XCL's).
 pub(super) unsafe fn is_adopted(obj: *mut c_void) -> bool {
-    !obj.is_null() && crate::gpu::shader::readable(obj as usize, 8) && is_ext(*(obj as *const usize))
+    !obj.is_null() && (obj as usize) & (std::mem::align_of::<usize>() - 1) == 0 && crate::gpu::shader::readable(obj as usize, 8) && is_ext(*(obj as *const usize))
 }
 
 /// A struct-returning method's first two arguments: true when `a` is the object (the C++ way:
@@ -5688,6 +5688,34 @@ mod this_first_tests {
             let stale = [vtbl];
             let s = stale.as_ptr() as *mut c_void;
             assert!(this_first(b, s) && this_first(s, b));
+            drop(Box::from_raw(obj as *mut [usize; 1]));
+        }
+        if let Some(g) = EXTS.lock().unwrap().as_mut() {
+            g.remove(&vtbl);
+        }
+    }
+
+    /// `is_adopted` and `this_first` with a 4-byte-aligned return buffer (e.g.
+    /// `D3D12_HEAP_PROPERTIES`, `[u32; 5]`): must not perform a misaligned `*const usize`
+    /// dereference and must never treat a misaligned buffer as an adopted COM object (#1130).
+    #[test]
+    fn misaligned_return_buffer_is_not_adopted_and_does_not_panic() {
+        #[repr(align(8))]
+        struct Aligned([u32; 6]);
+        let pc = [0usize; 32];
+        let ext = [pc.as_ptr() as usize, 0];
+        let vtbl = ext.as_ptr() as usize + 8;
+        EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(vtbl);
+        let obj = Box::into_raw(Box::new([vtbl])) as *mut c_void;
+        let mut buf = Aligned([0u32; 6]);
+        let unaligned = unsafe { buf.0.as_mut_ptr().add(1) } as *mut c_void;
+        assert_eq!((unaligned as usize) & 7, 4, "buffer must be 4-byte-aligned only");
+        unsafe {
+            // even with a stale vtable copy at the 4-byte-aligned address, it cannot be a COM object
+            (unaligned as *mut usize).write_unaligned(vtbl);
+            assert!(!is_adopted(unaligned));
+            assert!(this_first(obj, unaligned));
+            assert!(!this_first(unaligned, obj));
             drop(Box::from_raw(obj as *mut [usize; 1]));
         }
         if let Some(g) = EXTS.lock().unwrap().as_mut() {
