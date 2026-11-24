@@ -150,11 +150,13 @@ pub fn install_crash_handler() {
         SetUnhandledExceptionFilter(Some(unhandled_filter));
         install_invalid_parameter_handler();
         windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(0, Some(cpp_exception_logger));
-        windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(null_call_logger));
-        if std::env::var_os("XCL_ISA_REDIRECT").is_some_and(|v| v == "0") {
-            REDIRECT.store(false, Ordering::Relaxed);
+        if crate::util::mac_host() {
+            windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(null_call_logger));
+            if std::env::var_os("XCL_ISA_REDIRECT").is_some_and(|v| v == "0") {
+                REDIRECT.store(false, Ordering::Relaxed);
+            }
+            windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(unsupported_insn_handler));
         }
-        windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(unsupported_insn_handler));
         // `XCL_DUMP_THREADS_AT=40,90`: every thread's call stack that many seconds into the
         // run – what a title that neither crashes nor moves on is waiting for
         if let Ok(at) = std::env::var("XCL_DUMP_THREADS_AT") {
@@ -515,6 +517,10 @@ unsafe extern "system" fn unsupported_insn_handler(info: *mut EXCEPTION_POINTERS
 /// although nothing hangs. Both stores are recognised by their bytes and the watchdog goes
 /// on as if it had found no stale slot (`XCL_TITLE_WATCHDOG=1`: the crash stays).
 unsafe fn title_watchdog_resume(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) -> bool {
+    // Strictly gate on Mac host or explicit override so native Windows paths are untouched
+    if !cfg!(test) && !crate::util::mac_host() && std::env::var_os("XCL_WATCHDOG_BYPASS").is_none() {
+        return false;
+    }
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static SEEN: AtomicUsize = AtomicUsize::new(0);
     let rip = ctx.Rip as usize;
@@ -667,6 +673,9 @@ unsafe extern "system" fn probe_mov(info: *mut EXCEPTION_POINTERS) -> i32 {
 }
 
 unsafe extern "system" fn null_call_logger(info: *mut EXCEPTION_POINTERS) -> i32 {
+    if !cfg!(test) && !crate::util::mac_host() {
+        return 0;
+    }
     static SEEN: AtomicUsize = AtomicUsize::new(0);
     let rec = &*(*info).ExceptionRecord;
     if rec.ExceptionCode as u32 == 0xC000_0005 && title_watchdog_resume(&mut *(*info).ContextRecord) {

@@ -1474,7 +1474,9 @@ impl State {
         self.runs = None;
         for &t in &tiles {
             if let Ok(i) = pools.binary_search_by_key(&t, |p| p.0) {
-                self.parked.insert(t, pools[i].1);
+                if pools[i].1.0 != SHADOW_POOL {
+                    self.parked.insert(t, pools[i].1);
+                }
             }
         }
         MAPPED_GEN.fetch_add(1, Ordering::Release);
@@ -1485,6 +1487,9 @@ impl State {
 
     /// a pool tile no window maps, none is parked on and no buffer uses goes back to the free list
     fn release_if_unused(&mut self, tile: (u32, u32)) {
+        if tile.0 == SHADOW_POOL {
+            return;
+        }
         if !self.pinned.contains_key(&tile) && !self.mapped.values().any(|e| e.pool == tile) && !self.parked.values().any(|&p| p == tile) {
             self.free.push(tile);
         }
@@ -1499,6 +1504,9 @@ impl State {
         }
         let mut by_window: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
         for (t, tile) in std::mem::take(&mut self.parked) {
+            if tile.0 == SHADOW_POOL {
+                continue;
+            }
             if let Some(wi) = self.window_index(t) {
                 by_window.entry(wi).or_default().push(t);
             }
@@ -1552,6 +1560,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let t0 = std::time::Instant::now();
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };
+    s.forget_gone();
     // the title's work sees what was decommitted unmapped, as it was
     if s.flush_parked() {
         s.retire_free_pools();

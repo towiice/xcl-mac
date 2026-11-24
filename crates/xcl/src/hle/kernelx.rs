@@ -1238,9 +1238,16 @@ unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma:
         away.page.remove(&page);
         return Ok(false);
     }
+    if old == at {
+        return Ok(true);
+    }
     // (a destination that cannot be committed leaves the page where it was, mapped as before)
-    if !in_uma && mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
-        return Err(());
+    if !in_uma {
+        let mut old_prot = 0;
+        let _ = mem::VirtualProtect(at as *const c_void, PHYS_PAGE, mem::PAGE_READWRITE, &mut old_prot);
+        if mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
+            return Err(());
+        }
     }
     away.at.remove(&old);
     away.page.remove(&page);

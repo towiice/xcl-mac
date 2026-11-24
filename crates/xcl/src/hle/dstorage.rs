@@ -208,10 +208,17 @@ pub fn stats() -> DStorageStats {
 fn log_bcpack_refusal(r: &Request, k: u64) {
     let bc = r.bcpack();
     let key = format!("BCPack {}{}", bcpack_name(bc), if r.zlib() { " after zlib" } else { "" });
+    let action = if bcpack_accept_from_env() {
+        "interception active: solid-color fallback texture will be written and request marked S_OK"
+    } else if bcpack_fill_from_env() {
+        "solid-color fill active: request fails with E_DECOMPRESSION"
+    } else {
+        "the request fails with E_DECOMPRESSION"
+    };
     warn_once(
         &key,
         format_args!(
-            "mode {bc} unsupported (src={}, intermediate={}, dst={}, swizzle={}); the request fails with E_DECOMPRESSION",
+            "mode {bc} unsupported (src={}, intermediate={}, dst={}, swizzle={}); {action}",
             r.source_size,
             r.intermediate_size,
             r.destination_size,
@@ -1076,6 +1083,14 @@ impl QueueInner {
                             let filled = unsafe { bcpack_fill(&req, t) };
                             if filled && self.bcpack_accept.load(Ordering::Relaxed) {
                                 ok = true;
+                                static ACCEPTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                                let n = ACCEPTED.fetch_add(1, Ordering::Relaxed) + 1;
+                                if n <= 4 || n.is_power_of_two() {
+                                    crate::xlog_info!(
+                                        "DirectStorage: BCPack request #{n} (mode {}, {} bytes) fulfilled with solid-color fallback texture (S_OK)",
+                                        req.bcpack(), req.destination_size
+                                    );
+                                }
                             }
                         }
                         if !ok {
@@ -1194,6 +1209,12 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
     let ev = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
     if ev.is_null() {
         return E_ABORT;
+    }
+    if bcpack_accept_from_env() {
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::xlog_info!("DirectStorage: XCL_DSTORAGE_BCPACK_ACCEPT=1 active: BCPack requests will complete as S_OK with solid fallback textures");
+        }
     }
     let inner = Arc::new(QueueInner {
         desc: raw,
