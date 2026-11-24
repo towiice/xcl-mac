@@ -147,13 +147,16 @@ pub fn mac_host() -> bool {
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
     static MAC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *MAC.get_or_init(|| {
-        if !under_wine() {
-            return false;
-        }
         match std::env::var("XCL_MAC_HOST").as_deref().map(str::trim) {
             Ok("1") => return true,
             Ok("0") => return false,
             _ => {}
+        }
+        if rosetta() {
+            return true;
+        }
+        if !under_wine() {
+            return false;
         }
         // SAFETY: ntdll is always loaded; Wine's export fills two pointers to static strings.
         unsafe {

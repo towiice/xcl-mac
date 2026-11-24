@@ -1070,8 +1070,8 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (67, x::deserialize_pso_x as usize),
                 (70, dev_create_srv_at_x as usize),
                 (71, dev_create_uav_at_x as usize),
-                if crate::util::mac_host() { (73, dev_create_shader_cache_session as usize) } else { (73, x::create_command_list_x as usize) },
-                if crate::util::mac_host() { (74, dev_shader_cache_control as usize) } else { (74, x::register_page_pool_x as usize) },
+                if crate::util::mac_host() || crate::util::rosetta() { (73, dev_create_shader_cache_session as usize) } else { (73, x::create_command_list_x as usize) },
+                if crate::util::mac_host() || crate::util::rosetta() { (74, dev_shader_cache_control as usize) } else { (74, x::register_page_pool_x as usize) },
                 (75, x::unregister_page_pool_x as usize),
                 (76, dev_create_committed_resource_x as usize),
                 // frame pacing (SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX,
@@ -3532,12 +3532,12 @@ pub(super) unsafe extern "system" fn dev_create_shader_cache_session(
         }
     }
 
-    if crate::util::mac_host() {
+    if crate::util::mac_host() || crate::util::rosetta() || hr < 0 || hr == E_INVALIDARG || (*ppv).is_null() {
         if hr < 0 || hr == E_INVALIDARG || (*ppv).is_null() {
             static LOGGED: AtomicBool = AtomicBool::new(false);
             if !LOGGED.swap(true, Ordering::Relaxed) {
                 crate::xlog_info!(
-                    "D3D12.X: ID3D12Device9::CreateShaderCacheSession host returned {:#x} on Mac host - providing dummy shader cache session",
+                    "D3D12.X: ID3D12Device9::CreateShaderCacheSession host returned {:#x} - providing dummy shader cache session",
                     hr as u32
                 );
             }
