@@ -820,12 +820,15 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     // most derived PC interface this object implements
     let chain = layout::chain(kind.base());
     let qi: QiFn = std::mem::transmute(*ot);
-    let release: RefFn = std::mem::transmute(*ot.add(2));
     let mut iface = *chain.last().expect("layout chain");
     for i in &chain {
         let iid = layout::parse_guid(i.iid);
         let mut out = std::ptr::null_mut();
         if qi(obj, &iid, &mut out) >= 0 && !out.is_null() {
+            // A debug-layer, Wine, or DRED wrapper can return a different interface pointer.
+            // For the original object, keep using its native vtable during readoption.
+            let out_vtable = if out == obj { ot } else { vt(out) };
+            let release: RefFn = std::mem::transmute(*out_vtable.add(2));
             release(out);
             iface = i;
             break;

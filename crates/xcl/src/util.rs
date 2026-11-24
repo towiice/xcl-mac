@@ -234,7 +234,11 @@ pub unsafe fn write_cstr_out(src: &str, buf: *mut u8, size: usize, used: *mut us
 /// Win32-style "copy wide string" (GetModuleFileNameW semantics): returns chars written
 /// (without terminator) or `size` when truncated.
 pub unsafe fn write_wide_out(src: &str, buf: *mut u16, size: u32) -> u32 {
-    if buf.is_null() || size == 0 {
+    if size == 0 {
+        windows_sys::Win32::Foundation::SetLastError(122); // ERROR_INSUFFICIENT_BUFFER
+        return 0;
+    }
+    if buf.is_null() {
         return 0;
     }
     let w: Vec<u16> = src.encode_utf16().collect();
@@ -257,7 +261,11 @@ unsafe fn write_codepage_out(src: &str, codepage: u32, buf: *mut u8, size: u32) 
     use windows_sys::Win32::Foundation::{SetLastError, ERROR_INSUFFICIENT_BUFFER};
     use windows_sys::Win32::Globalization::WideCharToMultiByte;
 
-    if buf.is_null() || size == 0 {
+    if size == 0 {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    if buf.is_null() {
         return 0;
     }
     let w: Vec<u16> = src.encode_utf16().collect();
@@ -386,6 +394,27 @@ mod tests {
         assert!(!brand_names_rosetta(""));
         // this host's: a string, and the answer that goes with it
         assert_eq!(rosetta(), cpu_brand().starts_with("VirtualApple"));
+    }
+
+    #[test]
+    fn zero_size_module_filename_buffers_report_insufficient_buffer() {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_INSUFFICIENT_BUFFER};
+
+        unsafe {
+            let mut ansi = [0xAAu8; 2];
+            SetLastError(0x1234);
+            let result = write_ansi_out("C:\\game.exe", ansi.as_mut_ptr(), 0);
+            let error = GetLastError();
+            assert_eq!((result, error), (0, ERROR_INSUFFICIENT_BUFFER));
+            assert_eq!(ansi, [0xAA; 2]);
+
+            let mut wide = [0xAAAAu16; 2];
+            SetLastError(0x1234);
+            let result = write_wide_out("C:\\game.exe", wide.as_mut_ptr(), 0);
+            let error = GetLastError();
+            assert_eq!((result, error), (0, ERROR_INSUFFICIENT_BUFFER));
+            assert_eq!(wide, [0xAAAA; 2]);
+        }
     }
 
     #[test]

@@ -387,6 +387,9 @@ pub unsafe extern "system" fn XAsyncGetResult(
         Lookup::Invalid => E_INVALIDARG,
         Lookup::Finished(h) => {
             if h.status < 0 {
+                if !used.is_null() {
+                    *used = 0;
+                }
                 return h.status;
             }
             if h.flags & FLAG_CONSUMED != 0 {
@@ -401,12 +404,18 @@ pub unsafe extern "system" fn XAsyncGetResult(
             let (status, need) = {
                 let mut g = s.inner.lock().unwrap();
                 if !g.is_done() {
+                    if !used.is_null() {
+                        *used = 0;
+                    }
                     return E_PENDING;
                 }
                 if !identity.is_null() && s.identity != 0 && identity as usize != s.identity {
                     return E_INVALIDARG;
                 }
                 if g.status < 0 {
+                    if !used.is_null() {
+                        *used = 0;
+                    }
                     return g.status;
                 }
                 if g.result_size > 0 {
@@ -758,6 +767,25 @@ mod tests {
             assert_eq!(XAsyncGetStatus(&mut b, false), E_PENDING);
             XAsyncComplete(&mut b, 3, 0);
             assert_eq!(XAsyncGetStatus(&mut b, true), 3);
+        }
+    }
+
+    /// libHttpClient stores 0 into `*bufferUsed` before returning E_PENDING.
+    #[test]
+    fn get_result_writes_zero_used_while_pending() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XAsyncBegin(&mut b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), begins_without_work as usize), S_OK);
+            let mut used = 0xDEADusize;
+            let mut buf = [0u8; 4];
+            assert_eq!(
+                XAsyncGetResult(&mut b, std::ptr::null(), buf.len(), buf.as_mut_ptr() as _, &mut used),
+                E_PENDING
+            );
+            assert_eq!(used, 0, "pending GetResult must write *used = 0");
+            XAsyncComplete(&mut b, S_OK, 0);
+            assert_eq!(XAsyncGetStatus(&mut b, true), S_OK);
         }
     }
 

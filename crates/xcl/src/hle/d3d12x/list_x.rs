@@ -3325,6 +3325,14 @@ const PC_IA_SET_VERTEX_BUFFERS: usize = 44;
 pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, start: u32, n: u32, views: *const D3D12_VERTEX_BUFFER_VIEW) {
     let f = pc::<unsafe extern "system" fn(*mut c_void, u32, u32, *const D3D12_VERTEX_BUFFER_VIEW)>(this, PC_IA_SET_VERTEX_BUFFERS);
     if views.is_null() || n == 0 {
+        if views.is_null() && n != 0 {
+            with_bindings(this, |b| {
+                for slot in start..start + n {
+                    b.vertex_buffers.remove(&slot);
+                    b.vertex_titles.remove(&slot);
+                }
+            });
+        }
         return f(this, start, n, views);
     }
     let v: Vec<D3D12_VERTEX_BUFFER_VIEW> = (0..n as usize)
@@ -3359,8 +3367,14 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
     let titles: Vec<(u64, u32, u32)> = (0..n as usize).map(|k| { let t = views.add(k).read_unaligned(); (t.BufferLocation, t.SizeInBytes, t.StrideInBytes) }).collect();
     with_bindings(this, |b| {
         for (k, view) in kept.into_iter().enumerate() {
-            b.vertex_buffers.insert(start + k as u32, view);
-            b.vertex_titles.insert(start + k as u32, titles[k]);
+            let slot = start + k as u32;
+            if view.BufferLocation == 0 || view.SizeInBytes == 0 {
+                b.vertex_buffers.remove(&slot);
+                b.vertex_titles.remove(&slot);
+            } else {
+                b.vertex_buffers.insert(slot, view);
+                b.vertex_titles.insert(slot, titles[k]);
+            }
         }
     });
     f(this, start, n, v.as_ptr())

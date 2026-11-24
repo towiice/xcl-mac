@@ -135,6 +135,25 @@ check "Pointer alignment guard in is_adopted (align_of::<usize>)" \
 check "Heap mirroring and bounded root SRVs" \
     "grep -q 'mirrors::source' crates/xcl/src/hle/kernelx.rs && grep -q 'indirect::source' crates/xcl/src/hle/d3d12x/bind.rs && grep -q 'offset & !15' crates/xcl/src/hle/d3d12x/indirect.rs"
 
+# 10. Upstream Synchronization & Interface Safety
+check "Lock-free atomic pipeline building accounting (pso_async::counts)" \
+    "grep -q 'BUILDING: AtomicUsize' crates/xcl/src/hle/d3d12x/pso_async.rs && grep -q 'STATE_QUEUED' crates/xcl/src/hle/d3d12x/pso_async.rs"
+
+check "XUserCompare 64-bit pointer overflow prevention" \
+    "grep -q '(a as usize).cmp(&(b as usize))' crates/xcl/src/hle/xgameruntime/mod.rs"
+
+check "XAsyncGetResult zero-used out parameter preservation" \
+    "grep -q '\*used = 0' crates/xcl/src/hle/xgameruntime/xasync.rs"
+
+check "GetModuleFileName ERROR_INSUFFICIENT_BUFFER on size 0" \
+    "grep -q 'ERROR_INSUFFICIENT_BUFFER' crates/xcl/src/util.rs"
+
+check "Vertex buffer slot unbind & purge on null/zero views" \
+    "grep -q 'b.vertex_buffers.remove(&slot)' crates/xcl/src/hle/d3d12x/list_x.rs"
+
+check "QueryInterface wrapper interface vtable release dispatch" \
+    "grep -q 'out_vtable = if out == obj' crates/xcl/src/hle/d3d12x/real.rs"
+
 echo "======================================================================"
 echo "Verification Summary: $PASS Passed, $FAIL Failed"
 echo "======================================================================"
