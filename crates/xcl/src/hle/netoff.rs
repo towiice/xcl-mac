@@ -63,21 +63,20 @@ fn local_name(name: &str) -> bool {
     }
 }
 
-/// Local change: on unless `XCL_NETWORK=1` asks for the network. A title under bring-up
-/// crashes often and its crash reporter uploads a memory dump each time, so no run may depend
-/// on someone remembering a variable.
+/// Mac bring-up runs default to offline. Native Windows keeps its opt-in offline mode.
 pub fn enabled() -> bool {
-    !std::env::var("XCL_NETWORK").is_ok_and(|v| v.trim() == "1")
+    network_disabled(crate::util::mac_host(), std::env::var("XCL_NETWORK").ok().as_deref())
+}
+
+fn network_disabled(mac: bool, value: Option<&str>) -> bool {
+    let value = value.map(str::trim);
+    if mac { value != Some("1") } else { value == Some("0") }
 }
 
 /// (name, address, ws2_32 ordinal – 0: imported by name only)
 fn table() -> Vec<(&'static str, usize, u16)> {
-    vec![
+    let mut table = vec![
         ("WinHttpSendRequest", send_request as *const () as usize, 0),
-        // (nothing is sent before WinHttpSendRequest; these two look for a proxy on the network)
-        ("WinHttpGetProxyForUrl", no_proxy as *const () as usize, 0),
-        ("WinHttpDetectAutoProxyConfigUrl", no_proxy as *const () as usize, 0),
-        ("bind", bind as *const () as usize, 2),
         ("connect", connect as *const () as usize, 4),
         ("sendto", sendto as *const () as usize, 20),
         ("gethostbyname", gethostbyname as *const () as usize, 52),
@@ -86,7 +85,15 @@ fn table() -> Vec<(&'static str, usize, u16)> {
         ("getaddrinfo", getaddrinfo as *const () as usize, 0),
         ("GetAddrInfoW", getaddrinfo_w as *const () as usize, 0),
         ("GetAddrInfoExW", getaddrinfo_ex as *const () as usize, 0),
-    ]
+    ];
+    if crate::util::mac_host() {
+        table.extend([
+            ("WinHttpGetProxyForUrl", no_proxy as *const () as usize, 0),
+            ("WinHttpDetectAutoProxyConfigUrl", no_proxy as *const () as usize, 0),
+            ("bind", bind as *const () as usize, 2),
+        ]);
+    }
+    table
 }
 
 pub fn exports() -> Vec<(&'static str, usize)> {
@@ -347,9 +354,17 @@ mod tests {
     /// and run-time lookups of the networking DLLs resolve to is XCL's, never the host's: the
     /// calls that send (by name and by Winsock ordinal), and every function of the other DLLs.
     #[test]
+    fn offline_default_only_changes_on_mac() {
+        assert!(!network_disabled(false, None));
+        assert!(network_disabled(false, Some("0")));
+        assert!(network_disabled(true, None));
+        assert!(!network_disabled(true, Some("1")));
+    }
+
+    #[test]
     fn the_default_is_no_network_for_every_way_in() {
         use crate::pe::ImportName;
-        if std::env::var_os("XCL_NETWORK").is_some() {
+        if !crate::util::mac_host() || std::env::var_os("XCL_NETWORK").is_some() {
             return;
         }
         assert!(enabled());

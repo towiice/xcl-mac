@@ -125,6 +125,10 @@ static REPACKERS: Mutex<Option<HashMap<RepackerKey, Arc<Repacker>>>> = Mutex::ne
 static PACKED_SIGNATURES: Mutex<Option<HashMap<SignatureKey, ID3D12CommandSignature>>> = Mutex::new(None);
 static PENDING: Mutex<Option<HashMap<usize, Vec<ID3D12Resource>>>> = Mutex::new(None);
 
+pub(super) fn retain_resource(allocator: usize, resource: ID3D12Resource) {
+    PENDING.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().push(resource);
+}
+
 pub(super) fn allocator_reset(allocator: usize) {
     let buffers = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator));
     drop(buffers);
@@ -202,9 +206,9 @@ unsafe fn packed_signature(dev: &ID3D12Device, root: &ID3D12RootSignature, sig: 
 
 /// Read a title's GPU-produced buffer through its UMA window, or read a native upload
 /// buffer as an SRV (already in GENERIC_READ). The console offset excludes placement delta.
-unsafe fn source(resource: usize, offset: u64, bytes: u64) -> Option<(bool, u64, u32)> {
+pub(super) unsafe fn source(resource: usize, offset: u64, bytes: u64) -> Option<(bool, u64, u32)> {
     let end = offset.checked_add(bytes)?;
-    if offset % 4 != 0 {
+    if bytes == 0 || offset % 4 != 0 {
         return None;
     }
     if let Some((p, len)) = real::console_buffer(resource) {
@@ -215,7 +219,8 @@ unsafe fn source(resource: usize, offset: u64, bytes: u64) -> Option<(bool, u64,
         u32::try_from(at.checked_add(bytes - 1)?).ok()?;
         let window = window as *mut c_void;
         let window = ID3D12Resource::from_raw_borrowed(&window)?;
-        return Some((false, window.GetGPUVirtualAddress(), at as u32));
+        let va = window.GetGPUVirtualAddress();
+        return (va != 0).then_some((false, va, at as u32));
     }
     let raw = resource as *mut c_void;
     let r = ID3D12Resource::from_raw_borrowed(&raw)?;
@@ -231,7 +236,8 @@ unsafe fn source(resource: usize, offset: u64, bytes: u64) -> Option<(bool, u64,
     }
     // Root SRV addresses must be 16-byte aligned. Rebase to keep byte offsets in 32 bits.
     u32::try_from((offset & 15).checked_add(bytes - 1)?).ok()?;
-    Some((true, r.GetGPUVirtualAddress().checked_add(offset & !15)?, (offset & 15) as u32))
+    let va = r.GetGPUVirtualAddress();
+    (va != 0).then_some((true, va.checked_add(offset & !15)?, (offset & 15) as u32))
 }
 
 unsafe fn transition(list: &ID3D12GraphicsCommandList, resource: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
@@ -263,7 +269,7 @@ impl Recorded {
     }
 
     pub(super) fn retain_and_clear(self, allocator: usize, shadow: &mut [u8]) {
-        PENDING.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().push(self.arguments);
+        retain_resource(allocator, self.arguments);
         for p in self.patches {
             shadow[p.shadow..p.shadow + 4].fill(0);
         }

@@ -150,13 +150,17 @@ pub fn install_crash_handler() {
         SetUnhandledExceptionFilter(Some(unhandled_filter));
         install_invalid_parameter_handler();
         windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(0, Some(cpp_exception_logger));
-        if crate::util::mac_host() {
-            windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(null_call_logger));
-            if std::env::var_os("XCL_ISA_REDIRECT").is_some_and(|v| v == "0") {
-                REDIRECT.store(false, Ordering::Relaxed);
-            }
-            windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(unsupported_insn_handler));
+        if !crate::util::mac_host() {
+            return;
         }
+        WATCHDOG.store(
+            std::env::var_os("XCL_WATCHDOG_BYPASS").is_some_and(|v| v == "1")
+                && std::env::var_os("XCL_TITLE_WATCHDOG").is_none_or(|v| v != "1"),
+            Ordering::Release,
+        );
+        REDIRECT.store(std::env::var_os("XCL_ISA_REDIRECT").is_none_or(|v| v != "0"), Ordering::Relaxed);
+        windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(null_call_logger));
+        windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(unsupported_insn_handler));
         // `XCL_DUMP_THREADS_AT=40,90`: every thread's call stack that many seconds into the
         // run – what a title that neither crashes nor moves on is waiting for
         if let Ok(at) = std::env::var("XCL_DUMP_THREADS_AT") {
@@ -177,12 +181,16 @@ pub fn install_crash_handler() {
                         for item in list.split(',') {
                             let mut it = item.trim().split(':');
                             let (Some(a), n) = (it.next().and_then(|a| u64::from_str_radix(a, 16).ok()), it.next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(8)) else { continue };
-                            let at = m.base + (a as usize).wrapping_sub(0x1_4000_0000);
-                            if !m.contains(at) || !m.contains(at + n.min(8) - 1) {
+                            let n = n.min(8);
+                            let Some(at) = usize::try_from(a).ok()
+                                .and_then(|a| a.checked_sub(0x1_4000_0000))
+                                .and_then(|offset| m.base.checked_add(offset)) else { continue };
+                            let Some(last) = n.checked_sub(1).and_then(|n| at.checked_add(n)) else { continue };
+                            if !m.contains(at) || !m.contains(last) || !crate::gpu::shader::readable(at, n) {
                                 continue;
                             }
                             let mut v = 0u64;
-                            std::ptr::copy_nonoverlapping(at as *const u8, &mut v as *mut u64 as *mut u8, n.min(8));
+                            std::ptr::copy_nonoverlapping(at as *const u8, &mut v as *mut u64 as *mut u8, n);
                             crate::xlog_info!("peek {a:#x} ({n} B) = {v:#x}");
                         }
                     }
@@ -330,6 +338,7 @@ const HELPERS_SIZE: usize = 0x1_0000;
 /// Serialises site patching; `XCL_ISA_REDIRECT=0` turns it off (every use then traps).
 static PATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static REDIRECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static WATCHDOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Free address space for helpers within reach of a `call rel32` from `near`: the nearest
 /// `size` bytes (a multiple of 64 KiB) above it, else below; committed, readable, writable and
@@ -386,16 +395,24 @@ pub(crate) unsafe fn alloc_near(near: usize, size: usize) -> usize {
 /// Writes `call helper` over the site at `site` (whose bytes were `code` when it trapped).
 /// `true`: the site is to be run again – redirected now, or changed by another thread.
 unsafe fn redirect(site: usize, code: &[u8], t: &isa::Thunk, helper: &[u8; isa::THUNK_MAX]) -> bool {
+    use std::sync::atomic::AtomicU64;
     use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
     use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let n = t.site_len as usize;
     let Some(code) = code.get(..n) else { return false };
-    if !REDIRECT.load(Ordering::Relaxed) || !(5..=8).contains(&n) {
+    let block = site & !7;
+    let offset = site - block;
+    // A single aligned store avoids publishing a partial call, including at page
+    // boundaries. CLZERO's thunk also consumes the following instruction, which a
+    // contending thread could already be about to execute.
+    if !REDIRECT.load(Ordering::Relaxed) || t.op == isa::Op::Clzero
+        || !(5..=8).contains(&n) || offset + n > 8
+    {
         return false;
     }
-    while PATCHING.swap(true, Ordering::Acquire) {
-        std::hint::spin_loop();
+    if PATCHING.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        return false;
     }
     let done = (|| {
         if std::slice::from_raw_parts(site as *const u8, n) != code {
@@ -404,40 +421,41 @@ unsafe fn redirect(site: usize, code: &[u8], t: &isa::Thunk, helper: &[u8; isa::
         let mut pool = HELPERS.load(Ordering::Relaxed);
         if pool == 0 {
             pool = alloc_near(site, HELPERS_SIZE).max(1);
-            HELPERS.store(pool, Ordering::Relaxed);
+            HELPERS.store(pool, Ordering::Release);
         }
         let used = HELPERS_USED.load(Ordering::Relaxed);
         let at = match t.slot {
             _ if pool == 1 => return false,
-            Some(s) => pool + (s as usize % isa::ADX_SLOTS) * isa::ADX_SLOT,
+            Some(s) if (s as usize) < isa::ADX_SLOTS && (t.len as usize) <= isa::ADX_SLOT =>
+                pool + s as usize * isa::ADX_SLOT,
+            Some(_) => return false,
             None if used + isa::THUNK_MAX <= HELPERS_SIZE => pool + used,
             None => return false,
         };
         let Some(call) = isa::call_site(site as u64, t.site_len, at as u64) else { return false };
-        // eight bytes in one store where the page allows it: no thread runs half a call
-        let span = if site & 0xFFF <= 0xFF8 { 8 } else { n };
         let mut old = 0u32;
-        if VirtualProtect(site as *const _, span, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+        if VirtualProtect(block as *const _, 8, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
             return false;
         }
         // fresh memory is zero and no helper starts with a zero byte: an ADX slot is written once
         if *(at as *const u8) == 0 {
             std::ptr::copy_nonoverlapping(helper.as_ptr(), at as *mut u8, (t.len as usize).min(isa::THUNK_MAX));
-            FlushInstructionCache(GetCurrentProcess(), at as *const _, isa::THUNK_MAX);
+            if FlushInstructionCache(GetCurrentProcess(), at as *const _, t.len as usize) == 0 {
+                std::ptr::write_bytes(at as *mut u8, 0, t.len as usize);
+                VirtualProtect(block as *const _, 8, old, &mut old);
+                return false;
+            }
             if t.slot.is_none() {
                 HELPERS_USED.store(used + isa::THUNK_MAX, Ordering::Relaxed);
             }
         }
-        if span == 8 {
-            let mut b = (site as *const [u8; 8]).read_unaligned();
-            for (d, s) in b.iter_mut().zip(call).take(n) {
-                *d = s;
-            }
-            (site as *mut u64).write_unaligned(u64::from_le_bytes(b));
-        } else {
-            std::ptr::copy_nonoverlapping(call.as_ptr(), site as *mut u8, n);
+        {
+            let word = AtomicU64::from_ptr(block as *mut u64);
+            let mut bytes = word.load(Ordering::Relaxed).to_le_bytes();
+            bytes[offset..offset + n].copy_from_slice(&call[..n]);
+            word.store(u64::from_le_bytes(bytes), Ordering::Release);
         }
-        VirtualProtect(site as *const _, span, old, &mut old);
+        VirtualProtect(block as *const _, 8, old, &mut old);
         FlushInstructionCache(GetCurrentProcess(), site as *const _, n);
         true
     })();
@@ -452,12 +470,14 @@ unsafe fn note_insn(kind: usize, what: &str, redirected: bool, ip: usize) {
     static EMULATED: AtomicUsize = AtomicUsize::new(0);
     if SEEN.fetch_or(1 << kind, Ordering::Relaxed) & (1 << kind) == 0 {
         let how = if redirected { "each site calls a helper after its first use" } else { "emulated at each use" };
-        crate::xlog_warn!("CPU: {what} is not available on this host – {how} (first at {})", modules::describe_address(ip));
+        crate::log::try_write(crate::log::Level::Warn,
+            format_args!("CPU: {what} is not available on this host – {how} (first at {ip:#x})"));
     }
     if !redirected {
         let n = EMULATED.fetch_add(1, Ordering::Relaxed) + 1;
         if n == 10_000 || n == 1_000_000 {
-            crate::xlog_warn!("CPU: {n} instructions emulated by exception so far (now {what} at {}) – this is slow", modules::describe_address(ip));
+            crate::log::try_write(crate::log::Level::Warn,
+                format_args!("CPU: {n} instructions emulated by exception so far (now {what} at {ip:#x})"));
         }
     }
 }
@@ -465,15 +485,17 @@ unsafe fn note_insn(kind: usize, what: &str, redirected: bool, ip: usize) {
 /// Instructions a translator does not run although every PC CPU of the console's generation
 /// has them (Rosetta 2: ADX, RDSEED; SSE4a's MOVNTSS / MOVNTSD, which `insn` does not know),
 /// raised as illegal instructions: emulated on the context (`isa`). And a faster path for sites
-/// that run in loops, since a trap under a translator costs tens of microseconds: a site of
-/// five bytes or more (ADCX / ADOX, INSERTQ with immediates, CLZERO with the instruction after
-/// it in the title's zeroing loops) is redirected to a helper in host code and traps once.
+/// that run in loops, since a trap under a translator costs tens of microseconds: an ADCX,
+/// ADOX or immediate INSERTQ that fits a single aligned write can call a helper and trap once.
 /// Everything else – a lone CLZERO, CLWB, MONITORX / MWAITX, RDPRU, RDPID, EXTRQ, INSERTQ by
 /// register – is left to `emulate_console_only`, which runs after this handler.
 unsafe extern "system" fn unsupported_insn_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+    if info.is_null() || (*info).ExceptionRecord.is_null() || (*info).ContextRecord.is_null() {
+        return 0;
+    }
     let rec = &*(*info).ExceptionRecord;
     let ctx = &mut *(*info).ContextRecord;
-    if rec.ExceptionCode as u32 != 0xC000_001D {
+    if rec.ExceptionCode as u32 != ILLEGAL_INSTRUCTION || modules::image_base_for_addr(ctx.Rip as usize).is_none() {
         return 0;
     }
     let ip = ctx.Rip as *const u8;
@@ -483,7 +505,7 @@ unsafe extern "system" fn unsupported_insn_handler(info: *mut EXCEPTION_POINTERS
     // its way here with the old instruction. Run it again.
     if let (Some(0xE8), Some(rel)) = (code.first(), code.get(1..5)) {
         let to = (ip as usize + 5).wrapping_add(i32::from_le_bytes([rel[0], rel[1], rel[2], rel[3]]) as usize);
-        let pool = HELPERS.load(Ordering::Relaxed);
+        let pool = HELPERS.load(Ordering::Acquire);
         if pool > 1 && (pool..pool + HELPERS_SIZE).contains(&to) {
             return -1;
         }
@@ -494,15 +516,13 @@ unsafe extern "system" fn unsupported_insn_handler(info: *mut EXCEPTION_POINTERS
     }
     let mut helper = [0u8; isa::THUNK_MAX];
     if let Some(t) = isa::thunk(code, &mut helper) {
-        // a site that takes a call is never emulated: with CLZERO the call also covers the
-        // next instruction, where an emulated thread would return to
         if redirect(ip as usize, code, &t, &helper) {
             note_insn(t.op as usize, t.op.name(), true, ip as usize);
             return -1;
         }
     }
     if let Some(insn) = isa::decode(code) {
-        if isa::exec(&insn, &mut Regs(ctx)) {
+        if isa::exec(&insn, &mut Regs(ctx), isa_memory_accessible) {
             note_insn(8 + insn.op as usize, insn.op.name(), false, ip as usize);
             return -1;
         }
@@ -510,21 +530,44 @@ unsafe extern "system" fn unsupported_insn_handler(info: *mut EXCEPTION_POINTERS
     0
 }
 
+/// Do not raise a second fault while emulating an instruction in VEH.
+fn isa_memory_accessible(addr: usize, bytes: usize, write: bool) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READ,
+        PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY,
+        PAGE_READWRITE, PAGE_WRITECOPY,
+    };
+    let Some(end) = addr.checked_add(bytes) else { return false };
+    let writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    let required = if write { writable } else { writable | PAGE_READONLY | PAGE_EXECUTE_READ };
+    let mut at = addr;
+    while at < end {
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let size = unsafe { VirtualQuery(at as *const _, &mut info, std::mem::size_of_val(&info)) };
+        if size == 0 || info.State != MEM_COMMIT || info.Protect & PAGE_GUARD != 0 || info.Protect & required == 0 {
+            return false;
+        }
+        let Some(next) = (info.BaseAddress as usize).checked_add(info.RegionSize).filter(|&next| next > at) else {
+            return false;
+        };
+        at = next;
+    }
+    true
+}
+
 /// A retail title's stall watchdog (GTA VI 1.0.2.1, exe+0x2215b91..): a thread walks 64
 /// heartbeat slots and, when one is older than its limit, calls a hook (which stores to
 /// address 0 and returns) and then stores to address 0 itself – a deliberate crash that sends
 /// a report. A host that is slow for a moment (shader compiles, other programs) trips it
-/// although nothing hangs. Both stores are recognised by their bytes and the watchdog goes
-/// on as if it had found no stale slot (`XCL_TITLE_WATCHDOG=1`: the crash stays).
+/// although nothing hangs. `XCL_WATCHDOG_BYPASS=1` on a Mac resumes the recognized
+/// stores. `XCL_TITLE_WATCHDOG=1` keeps the crash.
 unsafe fn title_watchdog_resume(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) -> bool {
-    // Strictly gate on Mac host or explicit override so native Windows paths are untouched
-    if !cfg!(test) && !crate::util::mac_host() && std::env::var_os("XCL_WATCHDOG_BYPASS").is_none() {
+    if !cfg!(test) && (!crate::util::mac_host() || !WATCHDOG.load(Ordering::Acquire)) {
         return false;
     }
-    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static SEEN: AtomicUsize = AtomicUsize::new(0);
     let rip = ctx.Rip as usize;
-    if rip < 0x1_0000 || *KEEP.get_or_init(|| std::env::var("XCL_TITLE_WATCHDOG").is_ok_and(|v| v.trim() == "1")) || !crate::gpu::shader::readable(rip, 16) {
+    if rip < 0x1_0000 || !crate::gpu::shader::readable(rip, 12) {
         return false;
     }
     let at = |a: usize, n: usize| std::slice::from_raw_parts(a as *const u8, n);
@@ -539,24 +582,14 @@ unsafe fn title_watchdog_resume(ctx: &mut windows_sys::Win32::System::Diagnostic
     }
     // the fatal error / GPU hang watchdog (`mov dword ptr [0], 0x4d8bd421`): deliberate crash
     // tripped when world-load decompression or background compute pipeline builds take >30s
-    if at(rip + 7, 4) == [0x21, 0xD4, 0x8B, 0x4D] {
+    if at(rip + 7, 5) == [0x21, 0xD4, 0x8B, 0x4D, 0xC3] {
         let n = SEEN.fetch_add(1, Ordering::Relaxed);
         if n < 4 || n.is_power_of_two() {
-            crate::xlog_warn!("the title's fatal error / GPU hang watchdog triggered (#{n}: 0x4d8bd421 at rip={rip:#x}) – deliberate crash is skipped and title proceeds (XCL_TITLE_WATCHDOG=1 keeps the crash)");
+            crate::log::try_write(crate::log::Level::Warn,
+                format_args!("the title's fatal error / GPU hang watchdog triggered (#{n}: 0x4d8bd421 at rip={rip:#x}); resuming at the existing RET"));
         }
-        if at(rip + 11, 1) == [0xC3] {
-            ctx.Rip += 11;
-        } else if at(rip + 11, 1) == [0xCC] || at(rip + 11, 2) == [0x0F, 0x0B] {
-            let ret_addr = *(ctx.Rsp as *const usize);
-            if crate::gpu::shader::readable(ret_addr, 1) {
-                ctx.Rsp += 8;
-                ctx.Rip = ret_addr as u64;
-            } else {
-                ctx.Rip += 11;
-            }
-        } else {
-            ctx.Rip += 11;
-        }
+        // Let the existing RET execute with the title's stack and unwind state intact.
+        ctx.Rip += 11;
         return true;
     }
     // the watchdog: `mov r14, rsi; mov ebx, ebp` 0x29 bytes before, `mov r15, [rip+..]; mov r14, rsi;
@@ -569,7 +602,8 @@ unsafe fn title_watchdog_resume(ctx: &mut windows_sys::Win32::System::Diagnostic
     {
         let n = SEEN.fetch_add(1, Ordering::Relaxed);
         if n < 4 || n.is_power_of_two() {
-            crate::xlog_warn!("the title's stall watchdog fired (#{n}: a thread's heartbeat is older than its limit) – its deliberate crash is skipped and the title goes on (XCL_TITLE_WATCHDOG=1 keeps the crash)");
+            crate::log::try_write(crate::log::Level::Warn,
+                format_args!("the title's stall watchdog fired (#{n}); resuming at the recognized heartbeat check"));
         }
         ctx.Rsi = ctx.R14;
         ctx.Rip -= 0x42;
@@ -581,7 +615,7 @@ unsafe fn title_watchdog_resume(ctx: &mut windows_sys::Win32::System::Diagnostic
 /// A call or jump through a null (or near-null) pointer: logged with the return address and
 /// the registers, since the faulting address itself says nothing about the caller.
 /// the probes of `XCL_PROBE_MOV`: (address, the 7 bytes that were there)
-static MOV_PROBES: Mutex<Vec<(usize, [u8; 7])>> = Mutex::new(Vec::new());
+static MOV_PROBES: std::sync::OnceLock<Vec<(usize, [u8; 7])>> = std::sync::OnceLock::new();
 
 /// Waits for the title's image and puts a breakpoint on each `mov r64, [base + disp32]` named
 /// by its offset in the image (REX.W 8B /r with mod 10 and no SIB; anything else is refused).
@@ -595,25 +629,31 @@ unsafe fn arm_probes(offsets: &[usize]) {
             None => std::thread::sleep(std::time::Duration::from_millis(20)),
         }
     };
-    for &off in offsets {
-        let at = m.base + off;
-        if !m.contains(at) || !m.contains(at + 6) {
-            continue;
+    let probes: Vec<_> = offsets.iter().filter_map(|&off| {
+        let at = m.base.checked_add(off)?;
+        if !m.contains(at) || !m.contains(at.checked_add(6)?) || !crate::gpu::shader::readable(at, 7) {
+            return None;
         }
         let was = (at as *const [u8; 7]).read_unaligned();
         if was[0] & 0xFA != 0x48 || was[1] != 0x8B || was[2] >> 6 != 2 || was[2] & 7 == 4 {
             crate::xlog_warn!("XCL_PROBE_MOV: image +{off:#x} is not mov r64, [base + disp32] ({:02x?}) – not probed", was);
-            continue;
+            return None;
         }
+        Some((at, was))
+    }).collect();
+    // Publish every original byte before any thread can hit an inserted breakpoint.
+    if MOV_PROBES.set(probes).is_err() {
+        return;
+    }
+    for &(at, was) in MOV_PROBES.get().unwrap() {
         let mut old = 0u32;
         if VirtualProtect(at as *const c_void, 1, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
             continue;
         }
-        MOV_PROBES.lock().unwrap().push((at, was));
         (at as *mut u8).write_volatile(0xCC);
         VirtualProtect(at as *const c_void, 1, old, &mut old);
         FlushInstructionCache(GetCurrentProcess(), at as *const c_void, 1);
-        crate::xlog_info!("XCL_PROBE_MOV: image +{off:#x} ({:02x?}) is probed", was);
+        crate::xlog_info!("XCL_PROBE_MOV: image +{:#x} ({:02x?}) is probed", at - m.base, was);
     }
 }
 
@@ -623,12 +663,15 @@ unsafe fn arm_probes(offsets: &[usize]) {
 /// Rosetta 2 a masked store into write-protected memory ends the process with no exception
 /// for anyone to look at; the pointer is loaded right before such a loop).
 unsafe extern "system" fn probe_mov(info: *mut EXCEPTION_POINTERS) -> i32 {
+    if info.is_null() || (*info).ExceptionRecord.is_null() || (*info).ContextRecord.is_null() {
+        return 0;
+    }
     let rec = &*(*info).ExceptionRecord;
     if rec.ExceptionCode as u32 != 0x8000_0003 {
         return 0;
     }
     let site = rec.ExceptionAddress as usize;
-    let Some(was) = MOV_PROBES.lock().unwrap().iter().find(|p| p.0 == site).map(|p| p.1) else { return 0 };
+    let Some((_, was)) = MOV_PROBES.get().and_then(|probes| probes.iter().find(|p| p.0 == site)) else { return 0 };
     let ctx = &mut *(*info).ContextRecord;
     let reg = |ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, k: u8| -> *mut u64 {
         match k {
@@ -658,38 +701,41 @@ unsafe extern "system" fn probe_mov(info: *mut EXCEPTION_POINTERS) -> i32 {
             fn GetWriteWatch(flags: u32, base: *const c_void, size: usize, addresses: *mut *mut c_void, count: *mut usize, granularity: *mut u32) -> u32;
         }
         let watched = GetWriteWatch(0, (p & !0xFFF) as *const c_void, 0x1000, buf.as_mut_ptr(), &mut count, &mut grain) == 0;
-        crate::xlog_info!(
-            "probe #{n} at {}: loaded {value:#x} from {ea:#x}; rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x}; that memory: {}unified memory window {:?}{}, {}write-watched{}, allocation {:#x} (protection {:#x}), region {:#x}+{:#x} state {:#x} protection {:#x} type {:#x}",
-            modules::describe_address(site), ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi, ctx.Rdi,
+        crate::log::try_write(crate::log::Level::Info, format_args!(
+            "probe #{n} at {site:#x}: loaded {value:#x} from {ea:#x}; rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x}; that memory: {}unified memory window {:?}{}, {}write-watched, allocation {:#x} (protection {:#x}), region {:#x}+{:#x} state {:#x} protection {:#x} type {:#x}",
+            ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi, ctx.Rdi,
             if known { "" } else { "unknown to Windows, " },
             uma.and_then(|u| u.window_of(p)),
             if uma.is_some_and(|u| u.is_sparse(p)) { " (sparse)" } else { "" },
             if watched { "" } else { "not " },
-            if crate::hle::kernelx::in_graphics_reservation(p) { " (a graphics reservation)" } else { "" },
             m.AllocationBase as usize, m.AllocationProtect, m.BaseAddress as usize, m.RegionSize, m.State, m.Protect, m.Type
-        );
+        ));
     }
     -1 // EXCEPTION_CONTINUE_EXECUTION
 }
 
 unsafe extern "system" fn null_call_logger(info: *mut EXCEPTION_POINTERS) -> i32 {
-    if !cfg!(test) && !crate::util::mac_host() {
+    if (!cfg!(test) && !crate::util::mac_host()) || info.is_null()
+        || (*info).ExceptionRecord.is_null() || (*info).ContextRecord.is_null()
+    {
         return 0;
     }
     static SEEN: AtomicUsize = AtomicUsize::new(0);
     let rec = &*(*info).ExceptionRecord;
-    if rec.ExceptionCode as u32 == 0xC000_0005 && title_watchdog_resume(&mut *(*info).ContextRecord) {
+    let ctx = &mut *(*info).ContextRecord;
+    if rec.ExceptionCode as u32 == 0xC000_0005 && rec.NumberParameters >= 2
+        && rec.ExceptionInformation[0] == 1 && rec.ExceptionInformation[1] == 0
+        && rec.ExceptionAddress as u64 == ctx.Rip && modules::image_base_for_addr(ctx.Rip as usize).is_some()
+        && title_watchdog_resume(ctx)
+    {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
-    let ctx = &*(*info).ContextRecord;
     if rec.ExceptionCode as u32 == 0xC000_0005 && ctx.Rip < 0x1_0000 && SEEN.fetch_add(1, Ordering::Relaxed) < 4 {
         let ret = if crate::gpu::shader::readable(ctx.Rsp as usize, 8) { (ctx.Rsp as *const usize).read_unaligned() } else { 0 };
-        crate::xlog_error!(
-            "call through a null pointer (rip {:#x}): return address {}, rax={:#x} rcx={:#x} rdx={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} rbx={:#x} rsi={:#x} rdi={:#x}; on the stack: {}",
-            ctx.Rip, modules::describe_address(ret), ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.Rbx, ctx.Rsi, ctx.Rdi,
-            stack_callers(ctx.Rsp as usize)
-        );
-        crate::log::flush();
+        crate::log::try_write(crate::log::Level::Error, format_args!(
+            "call through a null pointer (rip {:#x}): return address {ret:#x}, rax={:#x} rcx={:#x} rdx={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} rbx={:#x} rsi={:#x} rdi={:#x}",
+            ctx.Rip, ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.Rbx, ctx.Rsi, ctx.Rdi,
+        ));
     }
     0
 }
@@ -1709,8 +1755,36 @@ mod tests {
             ctx.Rip = code as u64;
             assert!(title_watchdog_resume(&mut ctx));
             assert_eq!(ctx.Rip as usize, code + 11);
+            // A trap after the store is not a proven leaf return. In particular, this
+            // context has no valid stack address that could be read to synthesize a RET.
+            (code as *mut u8).add(11).write(0xCC);
+            ctx.Rip = code as u64;
+            assert!(!title_watchdog_resume(&mut ctx));
+            assert_eq!((ctx.Rip, ctx.Rsp), (code as u64, 0));
             VirtualFree(code as *mut _, 0, MEM_RELEASE);
         }
     }
-}
 
+    #[test]
+    fn isa_refuses_uncommitted_and_readonly_parts_of_cross_page_operands() {
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE,
+            MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE,
+        };
+        unsafe {
+            let pages = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(pages, 0);
+            assert_eq!(VirtualAlloc(pages as *const _, 0x1000, MEM_COMMIT, PAGE_READWRITE) as usize, pages);
+            let crossing = pages + 0xFFC;
+            assert!(!isa_memory_accessible(crossing, 8, false));
+            let second = pages + 0x1000;
+            assert_eq!(VirtualAlloc(second as *const _, 0x1000, MEM_COMMIT, PAGE_READWRITE) as usize, second);
+            assert!(isa_memory_accessible(crossing, 8, true));
+            let mut old = 0;
+            assert_ne!(VirtualProtect(second as *const _, 0x1000, PAGE_READONLY, &mut old), 0);
+            assert!(isa_memory_accessible(crossing, 8, false));
+            assert!(!isa_memory_accessible(crossing, 8, true));
+            VirtualFree(pages as *mut _, 0, MEM_RELEASE);
+        }
+    }
+}

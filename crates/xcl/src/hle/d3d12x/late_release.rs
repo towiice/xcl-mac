@@ -85,6 +85,9 @@ impl Held {
 }
 
 static HELD: Mutex<Option<Held>> = Mutex::new(None);
+// A Mac host can re-enter Release from a driver call. The callback only moves the
+// reference into this queue. The worker owns all fence operations and physical releases.
+static INCOMING: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// Whether last releases are held (`XCL_LATE_RELEASE=0` turns it off).
 pub fn enabled() -> bool {
@@ -100,6 +103,11 @@ const IDLE_WAIT: Duration = Duration::from_micros(300);
 /// frees the memory under a resource right after its last `Release` finds it unpinned, as
 /// before. Otherwise the thread here lets it go.
 pub unsafe fn hold(res: usize) {
+    if crate::util::mac_host() {
+        INCOMING.lock().unwrap_or_else(|e| e.into_inner()).push(res);
+        start_worker();
+        return;
+    }
     HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(res);
     let start = Instant::now();
     drain_known(true);
@@ -110,21 +118,44 @@ pub unsafe fn hold(res: usize) {
     if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
         return;
     }
+    start_worker();
+}
+
+fn start_worker() {
     // A thread of its own lets the held ones go: the title may release a resource and then
     // wait for its memory without another submit (an imported heap pins the pages under its
     // resources – unmapping them stood still while one was held "until the next submit").
     static THREAD: std::sync::Once = std::sync::Once::new();
     THREAD.call_once(|| {
-        let _ = std::thread::Builder::new().name("xcl-late-release".into()).spawn(|| loop {
+        if let Err(e) = std::thread::Builder::new().name("xcl-late-release".into()).spawn(|| loop {
             std::thread::sleep(TICK);
-            unsafe { drain_known(false) };
-        });
+            unsafe { drain_on_worker() };
+        }) {
+            crate::xlog_warn!("D3D12.X: could not start the deferred release worker: {e}");
+        }
     });
 }
 
 /// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
 /// upload ones.
 pub unsafe fn drain_known(seal_now: bool) {
+    if !crate::util::mac_host() {
+        drain(seal_now, false);
+    }
+}
+
+unsafe fn drain_on_worker() {
+    let mac = crate::util::mac_host();
+    if mac {
+        let incoming = std::mem::take(&mut *INCOMING.lock().unwrap_or_else(|e| e.into_inner()));
+        if !incoming.is_empty() {
+            HELD.lock().unwrap().get_or_insert_with(Held::default).open.extend(incoming);
+        }
+    }
+    drain(false, mac);
+}
+
+unsafe fn drain(seal_now: bool, mac: bool) {
     if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
         return;
     }
@@ -135,7 +166,13 @@ pub unsafe fn drain_known(seal_now: bool) {
             queues.push(q.clone());
         }
     }
-    queues.extend(super::sparse::queue());
+    // Sealing without the sparse queue could release resources still used by it.
+    if mac {
+        let Ok(queue) = super::sparse::try_queue() else { return };
+        queues.extend(queue);
+    } else {
+        queues.extend(super::sparse::queue());
+    }
     queues.extend(super::title_textures::upload_queues());
     let gone = match HELD.lock().unwrap().as_mut() {
         Some(h) => h.drain(&queues, seal_now),
@@ -143,8 +180,7 @@ pub unsafe fn drain_known(seal_now: bool) {
     };
     // (outside the lock: a release may end other objects, whose releases come back here)
     for res in gone {
-        let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
-        f(res as *mut c_void);
+        super::real::release_held_resource(res as *mut c_void, mac);
     }
 }
 

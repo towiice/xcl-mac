@@ -458,9 +458,10 @@ pub fn plan(image: &[u8], base: u64, sections: &[(u32, u32)], functions: &[(u32,
             }
             let rva = (s_start + site) as u32;
             let before = funcs.partition_point(|f| f.0 <= rva);
-            let (from, leaf) = match before.checked_sub(1).map(|i| funcs[i]) {
-                Some((start, end)) if rva < end => (start as usize, false),
-                Some((_, end)) if end as usize >= s_start && rva - end <= GAP_MAX => (end as usize, true),
+            let next_function = funcs.get(before).map_or(s_end, |f| f.0 as usize);
+            let (from, limit, leaf) = match before.checked_sub(1).map(|i| funcs[i]) {
+                Some((start, end)) if rva < end => (start as usize, end as usize, false),
+                Some((_, end)) if end as usize >= s_start && rva - end <= GAP_MAX => (end as usize, next_function, true),
                 _ => {
                     p.skipped.push((rva, Skip::NoFunction));
                     continue;
@@ -492,7 +493,10 @@ pub fn plan(image: &[u8], base: u64, sections: &[(u32, u32)], functions: &[(u32,
                 p.skipped.push((rva, why));
                 continue;
             }
-            let Some(store) = decode(&code[site..]).filter(|s| insn_len(&code[site..]) == Some(s.len as usize)) else {
+            // A replacement must stay inside the function, including when it starts in a
+            // gap just before a function with unwind data.
+            let bytes = &code[site..limit.min(s_end).min(next_function) - s_start];
+            let Some(store) = decode(bytes).filter(|s| insn_len(bytes) == Some(s.len as usize)) else {
                 p.skipped.push((rva, Skip::Form));
                 continue;
             };
@@ -726,6 +730,16 @@ mod tests {
         // a section that ends inside the pattern, and one with no function before it
         assert!(plan(&image, 0, &[(0x1000, 8)], &functions).sites.is_empty());
         assert_eq!(plan(&image, 0, &[(0x1000, 0x100)], &[]).skipped.len(), 3);
+    }
+
+    #[test]
+    fn a_store_may_not_cross_a_function_boundary() {
+        let mut image = [0x90; 32];
+        image[8..14].copy_from_slice(&[0xC4, 0xE2, 0x4D, 0x8E, 0x04, 0x90]);
+        let code = &[(0, 32)];
+        assert_eq!(plan(&image, 0, code, &[(0, 14)]).sites.len(), 1);
+        assert!(plan(&image, 0, code, &[(0, 10), (10, 32)]).sites.is_empty());
+        assert!(plan(&image, 0, code, &[(0, 8), (10, 32)]).sites.is_empty());
     }
 }
 

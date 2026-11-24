@@ -112,6 +112,8 @@ env XCL_TEXTURE_SKIP_UNCHANGED=1 XCL_NETWORK=0 wine64 xcl.exe run "C:\Games\Your
 | `XCL_MASKED_STORES` | `1` (On) | `0` (Off) | Rewrites AVX masked stores to safe Rosetta 2 helper calls |
 | `XCL_WATCHED_FALLBACK` | `0` (Off) | `1` (On) | Disables write-watch on fallback allocations outside windows |
 | `XCL_COHERENT_HEAPS` | `0` (Off) | `1` (On) | Avoids write-watch page protection traps on coherent heaps |
+| `XCL_WATCHDOG_BYPASS` | Off | — | Enables recovery for recognized watchdog sites. Unknown traps still follow normal exception handling. |
+| `XCL_DSTORAGE_BCPACK_ACCEPT` | Off | — | Set to `1` to complete eligible BCPack requests with solid placeholder blocks. Texture decompression is required for the original pixels. |
 | `XCL_FRAME_DUMP` | `0` | `0` | Dumps every Nth presented frame to disk with luminance telemetry |
 | `XCL_FRAME_DUMP_FROM` | `0` | `0` | Delays frame sampling until frame index N is reached |
 

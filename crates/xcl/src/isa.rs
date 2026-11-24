@@ -236,12 +236,14 @@ unsafe fn address<C: Cpu>(c: &C, rm: Rm, next: u64) -> Option<u64> {
     Some(a)
 }
 
-/// Runs `insn` on `c` and moves RIP past it. A memory operand is read or written at its
-/// effective address: the caller's fault if the instruction would have faulted there too.
+/// Runs `insn` on `c` and moves RIP past it. Declines memory operations when the
+/// supplied check cannot establish access to the entire operand.
 ///
 /// # Safety
-/// Dereferences the instruction's memory operand.
-pub unsafe fn exec<C: Cpu>(insn: &Insn, c: &mut C) -> bool {
+/// Dereferences the instruction's memory operand after the caller's access check.
+pub unsafe fn exec<C: Cpu>(
+    insn: &Insn, c: &mut C, accessible: impl FnOnce(usize, usize, bool) -> bool,
+) -> bool {
     let next = c.rip().wrapping_add(insn.len as u64);
     match insn.op {
         Op::Adcx | Op::Adox => {
@@ -250,6 +252,9 @@ pub unsafe fn exec<C: Cpu>(insn: &Insn, c: &mut C) -> bool {
                 Rm::Reg(r) => c.gpr(r),
                 rm => {
                     let Some(a) = address(c, rm, next) else { return false };
+                    if !accessible(a as usize, if wide { 8 } else { 4 }, false) {
+                        return false;
+                    }
                     if wide {
                         (a as *const u64).read_unaligned()
                     } else {
@@ -280,8 +285,12 @@ pub unsafe fn exec<C: Cpu>(insn: &Insn, c: &mut C) -> bool {
         }
         Op::Movntss | Op::Movntsd => {
             let Some(a) = address(c, insn.rm, next) else { return false };
+            let bytes = if insn.op == Op::Movntss { 4 } else { 8 };
+            if !accessible(a as usize, bytes, true) {
+                return false;
+            }
             let low = c.xmm(insn.reg).0;
-            if insn.op == Op::Movntss {
+            if bytes == 4 {
                 (a as *mut u32).write_unaligned(low as u32);
             } else {
                 (a as *mut u64).write_unaligned(low);

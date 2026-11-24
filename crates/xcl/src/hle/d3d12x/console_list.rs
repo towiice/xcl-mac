@@ -96,7 +96,7 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
         }
         None => blob.to_vec(),
     };
-    let r = |o: usize| rts0.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let r = |o: usize| rts0.get(o..o.checked_add(4)?).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
     let (n, poff) = (r(4)? as usize, r(8)? as usize);
     let mut l = Layout::default();
     // the parameters go into user SGPRs in order while each fits whole; from the first one
@@ -111,23 +111,24 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
             _ => Param::Table { at: l.size },
         };
         let bytes = match p {
-            Param::Constants { count, .. } => 4 * count,
+            Param::Constants { count, .. } => count.checked_mul(4)?,
             Param::Table { .. } => 4,
             Param::Descriptor { .. } => 8,
         };
-        spilled |= l.inline + bytes > 4 * INLINE_SGPRS;
+        let size = l.size.checked_add(bytes)?;
+        spilled |= bytes > 4 * INLINE_SGPRS - l.inline;
         if !spilled {
             l.inline += bytes;
         }
-        spilled_gfx |= l.inline_gfx + bytes > 4 * INLINE_SGPRS_GFX;
+        spilled_gfx |= bytes > 4 * INLINE_SGPRS_GFX - l.inline_gfx;
         if !spilled_gfx {
             l.inline_gfx += bytes;
         }
-        spilled_ms |= l.inline_ms + bytes > 4 * INLINE_SGPRS_MS;
+        spilled_ms |= bytes > 4 * INLINE_SGPRS_MS - l.inline_ms;
         if !spilled_ms {
             l.inline_ms += bytes;
         }
-        l.size += bytes;
+        l.size = size;
         l.params.push(p);
     }
     Some(l)
@@ -344,7 +345,9 @@ pub fn allocator_reset(allocator: *mut c_void) {
     if let Some(b) = blocks {
         unsafe { free_uma(&b) };
     }
-    super::bind::release_allocator_res(allocator as usize);
+    if crate::util::mac_host() {
+        super::bind::release_allocator_res(allocator as usize);
+    }
 }
 
 fn with_list<R>(obj: usize, f: impl FnOnce(&mut ListState) -> R) -> Option<R> {
@@ -1007,6 +1010,18 @@ mod tests {
         let l = layout_from_blob(&rts0(&[(1, 2), (2, 0), (0, 0)])).unwrap();
         let args: Vec<u8> = [1u32, 2, 0x5000, 4, 0x80].iter().flat_map(|w| w.to_le_bytes()).collect();
         assert_eq!(user_data_gfx(&l, &args, 0x200), vec![0x200, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0x5000, 4, 0x80]);
+    }
+
+    #[test]
+    fn malformed_root_constant_count_returns_none() {
+        let mut words = [0u32; 9];
+        words[1] = 1;
+        words[2] = 12;
+        words[3] = 1;
+        words[5] = 24;
+        words[8] = u32::MAX;
+        let blob: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        assert!(layout_from_blob(&blob).is_none());
     }
 
     #[test]

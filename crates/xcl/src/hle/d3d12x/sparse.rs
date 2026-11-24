@@ -150,7 +150,7 @@ fn decommit_tiles(
     while pg < end {
         let t = pg & !(TILE - 1);
         let tile_end = t.saturating_add(TILE).min(end);
-        if let Some(entry) = mapped.get_mut(&t) {
+        if let Some(entry) = mapped.get_mut(&t).filter(|e| e.pool.0 != SHADOW_POOL) {
             let mut newly_holed = 0u16;
             let mut p = pg;
             while p < tile_end {
@@ -490,7 +490,6 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
     let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
     let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-    let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
     let mut slots = Vec::with_capacity(UPLOAD_SLOTS);
     for _ in 0..UPLOAD_SLOTS {
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
@@ -501,6 +500,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
     let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
     let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None)?;
     rb_list.Close()?;
+    let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
     Ok(State {
         dev: dev.clone(),
         queue,
@@ -588,11 +588,13 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
         out.push((k, r.clone().into_raw() as usize, r.GetGPUVirtualAddress()));
         windows.push((base, r));
     }
+    if out.is_empty() && !crate::util::mac_host() {
+        return out;
+    }
     let made = (|| -> windows::core::Result<State> {
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
         let mut slots = Vec::with_capacity(UPLOAD_SLOTS);
         for _ in 0..UPLOAD_SLOTS {
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
@@ -608,6 +610,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
         let _ = rb_list.SetName(windows::core::w!("xcl sparse readback list"));
         let _ = rb_alloc.SetName(windows::core::w!("xcl sparse readback allocator"));
         let _ = queue.SetName(windows::core::w!("xcl sparse queue"));
+        let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
         Ok(State {
             dev: dev.clone(),
             queue,
@@ -1296,12 +1299,53 @@ pub unsafe fn free(p: usize) -> bool {
     u.sparse_release(p).is_some()
 }
 
+/// Release a resource-owned allocation without waiting for a sparse operation that can
+/// synchronously call the resource's Release hook on D3DMetal.
+pub(super) unsafe fn free_from_resource_release(p: usize) {
+    if !crate::util::mac_host() {
+        free(p);
+        return;
+    }
+    match STATE.try_lock() {
+        Ok(mut state) => free_owned_locked(p, state.as_mut()),
+        Err(std::sync::TryLockError::WouldBlock) => RELEASED.lock().unwrap().push(p),
+        Err(std::sync::TryLockError::Poisoned(_)) => {}
+    }
+}
+
+/// Resource-owned allocations whose Release re-entered a sparse operation.
+static RELEASED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Hold STATE through the host decommit and tile bookkeeping so snapshots cannot read freed
+/// pages. A failed host call leaves the address reserved and its tile tracked.
+unsafe fn free_owned_locked(p: usize, state: Option<&mut State>) {
+    let Some(u) = crate::gpu::uma::get().filter(|u| u.is_sparse(p)) else { return };
+    let Some((_, len)) = u.sparse_reservation(p).filter(|&(start, _)| start == p) else { return };
+    if VirtualFree(p as *mut c_void, len, MEM_DECOMMIT) == 0 {
+        return;
+    }
+    if let Some(s) = state {
+        s.decommit_range(p, len);
+    } else {
+        let (start, end) = page_span(p, len);
+        early_remove(&mut EARLY.lock().unwrap(), start, end);
+    }
+    u.sparse_release(p);
+}
+
 /// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
 /// `FillMemoryWith32BitValueX`, `CopyMemoryToMemoryX`) back to their CPU view so CPU reads
 /// and spin-waits see the GPU writes without clobbering `sent` hashes.
 /// The queue tile mappings go out on, once there is one.
 pub fn queue() -> Option<ID3D12CommandQueue> {
     STATE.lock().unwrap().as_ref().map(|s| s.queue.clone())
+}
+
+/// The queue to include in a D3DMetal late-release fence batch. On contention the batch
+/// must wait for another pass, including when the current thread holds STATE.
+pub(super) fn try_queue() -> Result<Option<ID3D12CommandQueue>, ()> {
+    let state = STATE.try_lock().map_err(|_| ())?;
+    Ok(state.as_ref().map(|s| s.queue.clone()))
 }
 
 pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
@@ -1399,11 +1443,12 @@ pub unsafe fn committed(a: usize, n: usize) {
 /// VirtualQuery walks the pages to the end of the run with the same state, which in a window
 /// with gigabytes reserved took 0.4 ms a call – 99,776 physical pages mapped in two minutes.
 pub fn page_committed(a: usize) -> Option<bool> {
-    let g = STATE.lock().unwrap();
+    let g = STATE.try_lock().ok()?;
     let s = g.as_ref()?;
     s.window_index(a)?;
     let t = a & !(TILE - 1);
-    Some(s.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << ((a - t) / PAGE)) == 0))
+    let entry = s.mapped.get(&t)?;
+    Some(entry.holes & (1u16 << ((a - t) / PAGE)) == 0)
 }
 
 /// The title decommitted `[a, a + n)`: tiles whose pages are all uncommitted (whether in one
@@ -1559,8 +1604,16 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
     let mut g = STATE.lock().unwrap();
+    if crate::util::mac_host() {
+        if let Some(s) = g.as_mut() {
+            s.forget_gone();
+        }
+        let released = std::mem::take(&mut *RELEASED.lock().unwrap());
+        for p in released {
+            free_owned_locked(p, g.as_mut());
+        }
+    }
     let Some(s) = g.as_mut() else { return };
-    s.forget_gone();
     // the title's work sees what was decommitted unmapped, as it was
     if s.flush_parked() {
         s.retire_free_pools();
@@ -1680,7 +1733,9 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     for &(_, tile) in &tiles {
         *s.pinned.entry(tile).or_default() += 1;
     }
-    s.forget_gone();
+    if crate::util::mac_host() {
+        s.forget_gone();
+    }
     s.buffers.insert(raw as usize, tiles.iter().map(|x| x.1).collect());
     s.signal();
     Some((hr, delta))
@@ -1688,6 +1743,12 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
 
 /// A placed buffer is gone: its tiles are not pinned by it any more.
 pub fn forget_buffer(res: usize) {
+    if !crate::util::mac_host() {
+        if let Some(s) = STATE.lock().unwrap().as_mut() {
+            s.forget(res);
+        }
+        return;
+    }
     // A release can come from inside a call the holder of the state's lock is making (a host
     // that releases its own references through the object's table – Apple's D3DMetal – does it
     // when a list of XCL's own is reset or executed): never wait for the lock here. What could
@@ -1732,6 +1793,27 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shadowed_window_tile_never_becomes_a_free_pool_tile() {
+        let base = TILE;
+        let mut mapped = FxHashMap::default();
+        mapped.insert(base, TileEntry::with_holes((SHADOW_POOL, 0), 0));
+        mapped.insert(base + TILE, TileEntry::with_holes((0, 42), 0));
+        let mut free = Vec::new();
+        let mut to_zero = Vec::new();
+        let unmapped = decommit_tiles(&mut mapped, &FxHashMap::default(), &mut free, &mut to_zero, base, 2 * TILE);
+        assert_eq!(unmapped, [base + TILE]);
+        assert_eq!(free, [(0, 42)]);
+        assert_eq!(mapped[&base].holes, 0);
+        assert!(to_zero.is_empty());
+    }
+
+    #[test]
+    fn a_reentrant_release_can_check_the_queue_without_waiting_for_sparse_state() {
+        let _state = STATE.lock().unwrap();
+        assert!(try_queue().is_err());
+    }
 
     /// A block freed on one thread while another allocates: its address goes back to the
     /// windows only once it is decommitted (released first, the decommit came after another

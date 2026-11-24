@@ -276,6 +276,9 @@ fn remote() -> u32 {
     }
     static PATH: OnceLock<Option<String>> = OnceLock::new();
     static STATE: Mutex<Option<R>> = Mutex::new(None);
+    if !crate::util::mac_host() {
+        return 0;
+    }
     let Some(path) = PATH.get_or_init(|| std::env::var("XCL_REMOTE_INPUT").ok().filter(|p| !p.trim().is_empty())) else { return 0 };
     let now = Instant::now();
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());

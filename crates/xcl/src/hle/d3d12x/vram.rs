@@ -637,6 +637,9 @@ fn tier2(dev: &ID3D12Device) -> bool {
 /// cannot make is not an error code: the process ends on an assertion. Arenas (placed resources
 /// in heaps) and committed textures are known to work.
 pub(super) fn on_pages() -> bool {
+    if !crate::util::mac_host() {
+        return std::env::var_os("XCL_VRAM_ARENAS").is_none();
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("XCL_VRAM_ARENAS") {
         Ok(v) => v.trim() == "0",

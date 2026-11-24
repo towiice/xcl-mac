@@ -205,12 +205,12 @@ pub fn stats() -> DStorageStats {
 
 /// Log a refused BCPack request: one warning per mode and zlib stage, then a running count on
 /// the first 16 refusals and every power of two.
-fn log_bcpack_refusal(r: &Request, k: u64) {
+fn log_bcpack_refusal(r: &Request, k: u64, fill: bool, accept: bool) {
     let bc = r.bcpack();
     let key = format!("BCPack {}{}", bcpack_name(bc), if r.zlib() { " after zlib" } else { "" });
-    let action = if bcpack_accept_from_env() {
-        "interception active: solid-color fallback texture will be written and request marked S_OK"
-    } else if bcpack_fill_from_env() {
+    let action = if accept {
+        "placeholder allowed: request succeeds only after a complete solid-block fill"
+    } else if fill {
         "solid-color fill active: request fails with E_DECOMPRESSION"
     } else {
         "the request fails with E_DECOMPRESSION"
@@ -237,11 +237,25 @@ fn bcpack_fill_from_env() -> bool {
     std::env::var("XCL_DSTORAGE_BCPACK_FILL").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0")
 }
 
-/// `XCL_DSTORAGE_BCPACK_ACCEPT=1`: a refused BCPack request whose destination was filled with
-/// solid blocks is marked as completed (S_OK) rather than E_DECOMPRESSION, so title preconditions
-/// (e.g. `cmp byte ptr [rsp+0x34], 1; jne 0x23cf683`) pass and world generation continues.
+/// `XCL_DSTORAGE_BCPACK_ACCEPT=1`: allow complete placeholder textures on the Mac host.
 fn bcpack_accept_from_env() -> bool {
-    std::env::var("XCL_DSTORAGE_BCPACK_ACCEPT").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0")
+    bcpack_accept_enabled(crate::util::mac_host(), std::env::var("XCL_DSTORAGE_BCPACK_ACCEPT").ok().as_deref())
+}
+
+fn bcpack_accept_enabled(mac: bool, value: Option<&str>) -> bool {
+    mac && value.is_some_and(|value| value.trim() == "1")
+}
+
+fn bcpack_placeholder_eligible(r: &Request) -> bool {
+    let block = match r.bcpack() {
+        1 | 4 => 8,
+        2 | 3 | 5..=7 => 16,
+        _ => return false,
+    };
+    r.swizzle() == 0
+        && r.source_size != 0
+        && r.destination_size != 0
+        && r.destination_size.is_multiple_of(block)
 }
 
 /// BC1 colour block: both endpoints magenta (565 `0xF81F`), every index 0.
@@ -281,16 +295,26 @@ enum FillTarget {
 unsafe fn bcpack_fill(r: &Request, target: &FillTarget) -> bool {
     let Some(block) = bcpack_fill_block(r.bcpack()) else { return false };
     let n = r.destination_size as usize;
-    let bytes: Vec<u8> = block.iter().copied().cycle().take(n).collect();
+    // Keep staging bounded even when a request spans many pages. The extra block
+    // lets a physical page continue the pattern at any byte offset.
+    const CHUNK: usize = 4096;
+    let mut bytes = [0u8; CHUNK + 16];
+    for (byte, value) in bytes.iter_mut().zip(block.iter().copied().cycle()) {
+        *byte = value;
+    }
+    let write = |dst: *mut u8, completed: usize, len: usize| {
+        let phase = completed % block.len();
+        for offset in (0..len).step_by(CHUNK) {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr().add(phase), dst.add(offset), CHUNK.min(len - offset));
+        }
+    };
     let ok = match target {
-        FillTarget::Pages(pages) => crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &bytes),
+        FillTarget::Pages(pages) => crate::hle::kernelx::write_physical_pages_with(pages, r.destination_page_offset as usize, n, write),
         FillTarget::Virtual => {
             if !writable(r.destination as usize, n) {
                 return false;
             }
-            if n > 0 {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), r.destination as *mut u8, n);
-            }
+            write(r.destination as *mut u8, 0, n);
             true
         }
     };
@@ -1081,8 +1105,10 @@ impl QueueInner {
                         let mut ok = false;
                         if let Some(t) = &fill {
                             let filled = unsafe { bcpack_fill(&req, t) };
-                            if filled && self.bcpack_accept.load(Ordering::Relaxed) {
+                            if filled && self.bcpack_accept.load(Ordering::Relaxed) && bcpack_placeholder_eligible(&req) {
                                 ok = true;
+                                REQUESTS.fetch_add(1, Ordering::Relaxed);
+                                BYTES.fetch_add(req.destination_size as u64, Ordering::Relaxed);
                                 static ACCEPTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                                 let n = ACCEPTED.fetch_add(1, Ordering::Relaxed) + 1;
                                 if n <= 4 || n.is_power_of_two() {
@@ -1210,7 +1236,8 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
     if ev.is_null() {
         return E_ABORT;
     }
-    if bcpack_accept_from_env() {
+    let bcpack_accept = bcpack_accept_from_env();
+    if bcpack_accept {
         static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             crate::xlog_info!("DirectStorage: XCL_DSTORAGE_BCPACK_ACCEPT=1 active: BCPack requests will complete as S_OK with solid fallback textures");
@@ -1228,7 +1255,7 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         error_event: ev as usize,
         errors: Mutex::new((0, None)),
         bcpack_fill: AtomicBool::new(bcpack_fill_from_env()),
-        bcpack_accept: AtomicBool::new(bcpack_accept_from_env()),
+        bcpack_accept: AtomicBool::new(bcpack_accept),
     });
     let o = new_object(queue_vtbl(), inner);
     let hr = queue_qi(o, riid, out);
@@ -1274,8 +1301,10 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         warn_once("EnqueueRequest", format_args!("refused ({hr:#x}): {r:x?}"));
         let mut fill = None;
         if hr == E_DECOMPRESSION && r.bcpack() != 0 {
-            log_bcpack_refusal(&r, BCPACK.note(&r));
-            if q.bcpack_fill.load(Ordering::Relaxed) || q.bcpack_accept.load(Ordering::Relaxed) {
+            let diagnostic_fill = q.bcpack_fill.load(Ordering::Relaxed);
+            let accept = q.bcpack_accept.load(Ordering::Relaxed) && bcpack_placeholder_eligible(&r);
+            log_bcpack_refusal(&r, BCPACK.note(&r), diagnostic_fill, accept);
+            if diagnostic_fill || accept {
                 fill = if !r.dest_physical_pages() {
                     Some(FillTarget::Virtual)
                 } else {
@@ -2309,6 +2338,24 @@ mod tests {
     }
 
     #[test]
+    fn bcpack_placeholder_success_requires_mac_host_and_explicit_opt_in() {
+        for value in [None, Some(""), Some("0"), Some("false"), Some("2")] {
+            assert!(!bcpack_accept_enabled(true, value));
+        }
+        assert!(!bcpack_accept_enabled(false, Some("1")));
+        assert!(bcpack_accept_enabled(true, Some("1")));
+
+        let r = |options, size, source| Request::parse(&request(
+            SOURCE_MEMORY_BIT | 7 << BCPACK_SHIFT | options, 0x1000, size, 0x2000, 0, source,
+        ));
+        assert!(bcpack_placeholder_eligible(&r(0, 32, 24)));
+        assert!(!bcpack_placeholder_eligible(&r(0, 24, 24)));
+        assert!(!bcpack_placeholder_eligible(&r(0, 0, 24)));
+        assert!(!bcpack_placeholder_eligible(&r(0, 32, 0)));
+        assert!(!bcpack_placeholder_eligible(&r(1 << SWIZZLE_SHIFT, 32, 24)));
+    }
+
+    #[test]
     fn a_refused_bcpack_request_is_filled_only_under_the_switch() {
         unsafe {
             let mut f = std::ptr::null_mut();
@@ -2358,8 +2405,16 @@ mod tests {
             assert!(dst[n..].iter().all(|&b| b == 0xCD), "nothing past the destination size");
             assert!(BCPACK.filled_bytes[7].load(Ordering::Relaxed) >= before + n as u64);
 
+            queue(q).bcpack_fill.store(false, Ordering::Relaxed);
             queue(q).bcpack_accept.store(true, Ordering::Relaxed);
-            assert_eq!(run(&mut dst, n as u32, 0), S_OK, "under bcpack_accept the request completes with S_OK");
+            dst.fill(0xCD);
+            assert_eq!(run(&mut dst, n as u32, 0), E_DECOMPRESSION, "a partial block is refused");
+            assert!(dst.iter().all(|&b| b == 0xCD));
+
+            let complete = n - 8;
+            assert_eq!(run(&mut dst, complete as u32, 1), S_OK);
+            assert!(dst[..complete].chunks_exact(block.len()).all(|b| b == block));
+            assert!(dst[complete..].iter().all(|&b| b == 0xCD));
 
             queue_close(q);
             queue_release(q);

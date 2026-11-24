@@ -435,11 +435,12 @@ fn own_heaps(setting: Option<&str>, wine: bool) -> bool {
 
 /// IMalloc for a new compiler (`HeapMalloc`), None when off or unavailable.
 fn compiler_malloc() -> Option<*mut c_void> {
-    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    if !crate::util::mac_host() {
+        return None;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     let on = *ON.get_or_init(|| {
-        let wine = unsafe { GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8), c"wine_get_version".as_ptr() as *const u8).is_some() };
-        let on = own_heaps(std::env::var("XCL_DXC_HEAP").ok().as_deref(), wine);
+        let on = own_heaps(std::env::var("XCL_DXC_HEAP").ok().as_deref(), crate::util::under_wine());
         if on {
             crate::xlog_info!("DXC: each compile thread allocates from a heap of its own (XCL_DXC_HEAP=0 for the process heap)");
         }

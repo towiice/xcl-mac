@@ -130,8 +130,10 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         }
     }
 
-    // 3b. masked stores, where the host cannot resume one after a fault
-    if masked_store_helpers() {
+    // Validate imports before the Rosetta rewrite. Rejected images never expose any
+    // calls and should not leave a dynamic function table or helper pool behind.
+    let early_imports = masked_store_helpers().then(|| pe.imports());
+    if early_imports.as_ref().is_some_and(Result::is_ok) {
         let code: Vec<(u32, u32)> = pe.sections.iter().filter(|s| s.characteristics & 0x2000_0000 != 0).map(|s| (s.va, s.mapped_size())).collect();
         let ex = pe.dir(pe::DIR_EXCEPTION);
         unsafe { replace_masked_stores(base, size, &code, (ex.rva, ex.size), &name) };
@@ -167,7 +169,7 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     // 4. imports (normal + delay-load, resolved eagerly). A failure from here on takes the
     // module out of the registry again: a later load must not find it (its memory freed, or
     // never initialised) and take it for loaded
-    let mut all = match pe.imports() {
+    let mut all = match early_imports.unwrap_or_else(|| pe.imports()) {
         Ok(v) => v,
         Err(e) => {
             // nothing was resolved against it yet: its memory goes too
@@ -242,14 +244,17 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
 }
 
 /// Whether a title's AVX masked stores are replaced by calls to helpers (`maskmov`):
-/// `XCL_MASKED_STORES=1` / `0`, else only where the title's code runs through Rosetta 2
-/// (`util::rosetta`) – on a CPU the instructions are left alone.
+/// Enabled where the title's code runs through Rosetta 2, unless disabled by
+/// `XCL_MASKED_STORES=0`.
 fn masked_store_helpers() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("XCL_MASKED_STORES") {
-        Ok(v) => v.trim() != "0",
-        Err(_) => crate::util::rosetta(),
+    *ON.get_or_init(|| {
+        masked_store_helpers_for(crate::util::rosetta(), std::env::var("XCL_MASKED_STORES").ok().as_deref())
     })
+}
+
+fn masked_store_helpers_for(rosetta: bool, setting: Option<&str>) -> bool {
+    rosetta && setting.is_none_or(|v| v.trim() != "0")
 }
 
 /// Replaces the masked stores of the image mapped at `base` (relocated, its sections still
@@ -298,22 +303,32 @@ unsafe fn replace_masked_stores(base: usize, size: usize, code: &[(u32, u32)], u
         (e.BeginAddress, e.EndAddress) = (start, end);
         e.Anonymous.UnwindInfoAddress = unwind_at as u32;
     }
-    let (mut done, mut leaf, mut far) = ([0usize; 4], 0usize, 0usize);
-    for s in &plan.sites {
+    let patches: Vec<_> = plan.sites.iter().filter_map(|s| {
         let site = base + s.rva as usize;
-        let Some(call) = maskmov::call_site(site as u64, s.store.len, (pool + s.helper as usize) as u64) else {
-            far += 1;
-            continue;
-        };
+        let call = maskmov::call_site(site as u64, s.store.len, (pool + s.helper as usize) as u64)?;
+        Some((s, site, call))
+    }).collect();
+    if patches.is_empty() {
+        VirtualFree(pool as *mut c_void, 0, MEM_RELEASE);
+        crate::xlog_warn!("{name}: no masked-store helper is within call range");
+        return 0;
+    }
+    let mut old = 0u32;
+    if VirtualProtect(pool as *const c_void, pool_size, PAGE_EXECUTE_READ, &mut old) == 0
+        || FlushInstructionCache(GetCurrentProcess(), pool as *const c_void, pool_size) == 0
+        || !RtlAddFunctionTable(table, plan.helpers.len() as u32, pool as u64)
+    {
+        VirtualFree(pool as *mut c_void, 0, MEM_RELEASE);
+        crate::xlog_warn!("{name}: failed to prepare executable masked-store helpers and their unwind data");
+        return 0;
+    }
+    // The helpers and their unwind entries must be usable before any title bytes point at them.
+    let far = plan.sites.len() - patches.len();
+    let (mut done, mut leaf) = ([0usize; 4], 0usize);
+    for (s, site, call) in patches {
         std::ptr::copy_nonoverlapping(call.as_ptr(), site as *mut u8, s.store.len as usize);
         done[Kind::ALL.iter().position(|&k| k == s.store.kind).unwrap_or(0)] += 1;
         leaf += s.leaf as usize;
-    }
-    let mut old = 0u32;
-    VirtualProtect(pool as *const c_void, pool_size, PAGE_EXECUTE_READ, &mut old);
-    FlushInstructionCache(GetCurrentProcess(), pool as *const c_void, pool_size);
-    if !RtlAddFunctionTable(table, plan.helpers.len() as u32, pool as u64) {
-        crate::xlog_warn!("{name}: RtlAddFunctionTable for the masked-store helpers at {pool:#x} failed");
     }
     MASKED_STORE_HELPERS.lock().unwrap().push((pool, pool + plan.code.len()));
     let kinds: Vec<String> = Kind::ALL.iter().zip(done).filter(|(_, n)| *n != 0).map(|(k, n)| format!("{n} {}", k.name())).collect();
@@ -528,6 +543,13 @@ pub fn on_tls_event(reason: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn masked_store_override_cannot_enable_rewriting_without_rosetta() {
+        assert!(!masked_store_helpers_for(false, Some("1")));
+        assert!(!masked_store_helpers_for(true, Some("0")));
+        assert!(masked_store_helpers_for(true, None));
+    }
 
     /// A PE32+ DLL of one section (.text at RVA 0x1000) holding `code`, its entry point at the
     /// start of it, preferred at `image_base` and relocatable (one empty block at RVA 0x1100);

@@ -97,6 +97,18 @@ pub fn flush() {
     }
 }
 
+/// Best-effort file logging from a host callback that can interrupt the logger.
+pub(crate) fn try_write(level: Level, args: std::fmt::Arguments<'_>) {
+    if !enabled(level) {
+        return;
+    }
+    let Ok(mut file) = FILE.try_lock() else { return };
+    let Some(file) = file.as_mut() else { return };
+    let time = START.get().map_or(0.0, |start| start.elapsed().as_secs_f64());
+    let tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    let _ = writeln!(file, "[{time:9.3}][{tid:5}][{}] {args}", level.tag());
+}
+
 #[macro_export]
 macro_rules! xlog_error { ($($a:tt)*) => { $crate::log::write($crate::log::Level::Error, format_args!($($a)*)) } }
 #[macro_export]

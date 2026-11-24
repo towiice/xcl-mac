@@ -731,7 +731,7 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
 pub fn depth_only() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // (not kept before there is a device: `NATIVE_HOST_MEMORY` is set when it is adopted)
-    if !crate::gpu::shader::NATIVE_HOST_MEMORY.load(Ordering::Relaxed) {
+    if !crate::util::mac_host() || !crate::gpu::shader::NATIVE_HOST_MEMORY.load(Ordering::Relaxed) {
         return false;
     }
     *ON.get_or_init(|| !std::env::var("XCL_DEPTH_STENCIL").is_ok_and(|v| v.trim() == "1"))
@@ -1083,19 +1083,6 @@ pub(super) unsafe extern "system" fn get_copyable_footprints_x(
     }
 }
 
-fn indirect_arg_bytes(arg: &[u32; 4]) -> u32 {
-    match arg[0] {
-        0 => 16,
-        1 => 20,
-        2 | 10 => 12,
-        3 | 4 => 16,
-        5 => arg[3].saturating_mul(4),
-        6..=8 => 8,
-        9 => 108,
-        _ => 0,
-    }
-}
-
 pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_void, desc: *const u8, root: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     if desc.is_null() || ppv.is_null() {
         return E_INVALIDARG;
@@ -1113,26 +1100,18 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     let needs_root = list.iter().any(|a| (5..=8).contains(&a[0]));
     pc[8..16].copy_from_slice(&(if list.is_empty() { 0 } else { list.as_ptr() as u64 }).to_le_bytes());
     let hr = real::dev_create_command_signature(this, pc.as_ptr() as usize, if needs_root { root } else { 0 }, riid, ppv);
-    if hr >= 0 && !ppv.is_null() {
-        if needs_root {
+    if hr >= 0 && !(*ppv).is_null() {
+        let sig = *ppv as usize;
+        if crate::util::mac_host() {
             let stride = u32::from_le_bytes(pc[..4].try_into().unwrap());
-            super::indirect::register(*ppv as usize, stride, &list);
-            super::bind::note_root_changing_signature(*ppv as usize);
-        } else {
-            super::indirect::forget(*ppv as usize);
-            if let Some(idx) = list.iter().position(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32) {
-                let offset: u32 = list[..idx].iter().map(indirect_arg_bytes).sum();
-                let byte_stride = u32::from_le_bytes(pc[0..4].try_into().unwrap());
-                let mut dispatch_list = list.clone();
-                dispatch_list[idx][0] = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32;
-                let mut dpc = pc;
-                dpc[8..16].copy_from_slice(&(dispatch_list.as_ptr() as u64).to_le_bytes());
-                let mut companion: *mut c_void = std::ptr::null_mut();
-                let hr2 = real::dev_create_command_signature(this, dpc.as_ptr() as usize, 0, riid, &mut companion);
-                if hr2 >= 0 && !companion.is_null() {
-                    super::bind::note_dispatch_mesh_signature(*ppv as usize, companion as usize, byte_stride, offset);
-                }
+            super::bind::forget_mac_signatures(sig);
+            if needs_root {
+                super::indirect::register(sig, stride, &list);
+            } else if matches!(list.as_slice(), [a] if a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32) {
+                super::bind::note_dispatch_mesh_signature(sig, stride);
             }
+        } else if needs_root {
+            super::bind::note_root_changing_signature(sig);
         }
     }
     hr

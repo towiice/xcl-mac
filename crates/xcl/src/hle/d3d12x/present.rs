@@ -807,7 +807,12 @@ fn frame_dump_due() -> bool {
             Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
             Err(_) => 0,
         };
-        (every, std::env::var("XCL_FRAME_DUMP_FROM").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+        let from = if crate::util::mac_host() {
+            std::env::var("XCL_FRAME_DUMP_FROM").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+        } else {
+            0
+        };
+        (every, from)
     });
     // the first frames too: a title under bring-up may never reach its 20th
     let n = PRESENTS.load(Ordering::Relaxed);

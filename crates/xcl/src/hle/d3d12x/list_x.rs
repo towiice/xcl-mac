@@ -1968,7 +1968,7 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
     }
     let (Some((d, doff)), Some((s, soff))) = (real::uma_window_buffer(dst as usize, size as usize), real::uma_window_buffer(src as usize, size as usize)) else {
         note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
-        if cpu_copy(this, dst as usize, src as usize, size as usize) {
+        if crate::util::mac_host() && cpu_copy(this, dst as usize, src as usize, size as usize) {
             return;
         }
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
@@ -1996,8 +1996,15 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
 /// work before it (`cpu_writes`). Whether the copy was taken.
 unsafe fn cpu_copy(list: *mut c_void, dst: usize, src: usize, len: usize) -> bool {
     let Some(u) = crate::gpu::uma::get() else { return false };
-    let in_uma = |a: usize| u.window_of(a).is_some() || u.window_of(a + len - 1).is_some();
-    if in_uma(dst) || in_uma(src) || !super::cpu_writes::writable(dst, len) || super::title_textures::gpu_written_over(src, len) {
+    let Some(last_byte) = len.checked_sub(1) else { return false };
+    let (Some(dst_end), Some(src_end)) = (dst.checked_add(last_byte), src.checked_add(last_byte)) else { return false };
+    let in_uma = |start: usize, end: usize| {
+        (0..u.shader_windows()).any(|k| {
+            let (base, size) = u.window(k);
+            size != 0 && start < base + size && end >= base
+        })
+    };
+    if in_uma(dst, dst_end) || in_uma(src, src_end) || !super::cpu_writes::writable(dst, len) || super::title_textures::gpu_written_over(src, len) {
         return false;
     }
     let view = crate::hle::kernelx::mirrors::source(src).is_some() || super::gpu_views::in_range(src, len);

@@ -304,6 +304,9 @@ unsafe fn check_uma_import(device: &ID3D12Device, u: &crate::gpu::uma::Uma, bufs
 /// `XCL_UMA_SHADOW`: 1 = the committed windows get GPU copies without asking for a heap over
 /// them (to try the path on a GPU that has `OpenExistingHeapFromAddress`), 0 = never.
 fn shadow_choice() -> Option<bool> {
+    if !crate::util::mac_host() {
+        return Some(false);
+    }
     std::env::var("XCL_UMA_SHADOW").ok().map(|v| v != "0")
 }
 
@@ -615,7 +618,7 @@ pub fn init() -> Result<String, String> {
         // (11 places, e.g. exe+0x6ddf5): 0 – it writes a CBV's V# and descriptor copies into
         // the heap's memory itself; else it calls #17 / #24. Here the byte is the host
         // object's, so which way a run goes is the host's doing: said once, for the log.
-        if crate::gpu::shader::readable(raw as usize + 0x18, 1) {
+        if crate::util::mac_host() && crate::gpu::shader::readable(raw as usize + 0x18, 1) {
             let b = *(raw as *const u8).add(0x18);
             let way = if b == 0 { "writes CBVs and descriptor copies itself (no #17 / #24 calls)" } else { "calls CreateConstantBufferView / CopyDescriptorsSimple" };
             crate::xlog_info!("D3D12.X: device byte +0x18 = {b:#04x} – console code with inlined descriptor writes {way}");
@@ -847,7 +850,7 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     // as the host's and gets the guard – the host's own calls reach the host's word, a title's
     // XCL's stub or method – and the host's words after them follow XCL's slots, so a call of
     // its own never runs off the end.
-    let native_host = m0 == 0;
+    let native_host = crate::util::mac_host() && m0 == 0;
     if native_host {
         static ONCE: AtomicBool = AtomicBool::new(false);
         if !ONCE.swap(true, Ordering::Relaxed) {
@@ -859,7 +862,7 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     let mut v: Vec<usize> = Vec::with_capacity(total + HDR + if native_host { NATIVE_HOST_TAIL } else { 0 });
     v.push(orig);
     // (a table at the very start of its mapping has no words in front of it)
-    let prefix = native_host || crate::gpu::shader::readable(orig - 8 * PREFIX, 8 * PREFIX);
+    let prefix = native_host;
     for k in (1..=PREFIX).rev() {
         v.push(if prefix { *ot.sub(k) } else { 0 });
     }
@@ -1073,11 +1076,10 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (80, super::frame::wait_frame_event_x as usize),
                 (81, super::frame::frame_statistics_x as usize),
                 (86, x::create_pipeline_state_x as usize),
-                (101, x::create_state_object_x as usize),
                 (108, x::get_resource_allocation_info2_x as usize),
                 (127, dev_create_committed_resource_layout_x as usize),
                 (133, x::create_placed_resource_layout_x as usize),
-            ]
+            ].into_iter().chain(crate::util::mac_host().then_some((101, x::create_state_object_x as usize))).collect()
         }
         Kind::DescriptorHeap => vec![(9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
         Kind::Resource => vec![(11, res_gpu_va_x as usize)],
@@ -1152,12 +1154,12 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (90, l::write32_bottom_of_shader_x as usize),
                 (93, l::kickoff_x as usize),
                 (94, l::set_depth_bias_x as usize),
-                (127, b::dispatch_mesh as usize),
-                (129, b::dispatch_mesh as usize),
                 // console compute/BVH builder extensions (`XboxBvhBuilder.dll`)
                 (146, l::uav_barrier_x as usize),
                 (148, b::allocate_upload_memory as usize),
-            ]
+            ].into_iter().chain(crate::util::mac_host().then_some([
+                (127, b::dispatch_mesh as usize), (129, b::dispatch_mesh as usize),
+            ]).into_iter().flatten()).collect()
         }
         _ => vec![],
     }
@@ -1712,36 +1714,48 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     } else {
         f(this)
     };
-    if n == 0 {
-        if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
-            s.remove(&(this as usize));
-        }
-        if let Some(s) = SPARSE_READBACK.lock().unwrap().as_mut() {
-            s.remove(&(this as usize));
-        }
-        if let Some(m) = BUFFER_DELTA.lock().unwrap().as_mut() {
-            m.remove(&(this as usize));
-        }
-        if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
-            m.remove(&(this as usize));
-        }
-        super::sparse::forget_buffer(this as usize);
-        super::present::forget(this as usize);
-        super::vram::forget(this as usize);
-        super::title_textures::forget(this as usize);
-        let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
-        if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
-            if u.is_sparse(p) {
-                super::sparse::free(p);
-            } else {
-                u.free(p);
-            }
-        }
+    // Keep the backing and its pins alive together with the resource on D3DMetal.
+    if n == 0 && !(held && crate::util::mac_host()) {
+        forget_resource(this as usize);
     }
     if held {
         super::late_release::hold(this as usize);
     }
     n
+}
+
+pub(super) unsafe fn release_held_resource(this: *mut c_void, mac: bool) {
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    if f(this) == 0 && mac {
+        forget_resource(this as usize);
+    }
+}
+
+unsafe fn forget_resource(res: usize) {
+    if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
+        s.remove(&res);
+    }
+    if let Some(s) = SPARSE_READBACK.lock().unwrap().as_mut() {
+        s.remove(&res);
+    }
+    if let Some(m) = BUFFER_DELTA.lock().unwrap().as_mut() {
+        m.remove(&res);
+    }
+    if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
+        m.remove(&res);
+    }
+    super::sparse::forget_buffer(res);
+    super::present::forget(res);
+    super::vram::forget(res);
+    super::title_textures::forget(res);
+    let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&res));
+    if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
+        if u.is_sparse(p) {
+            super::sparse::free_from_resource_release(p);
+        } else {
+            u.free(p);
+        }
+    }
 }
 
 /// A stand-in pipeline released for good takes its background-built real pipeline with it.
@@ -2066,11 +2080,13 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     }
     // a native host: the resource's own depth family whatever the view names (Metal ends the
     // process on a view of another family, `device_x::depth_only`)
-    if let (Some(c), Some(r)) = (copy.as_mut(), ID3D12Resource::from_raw_borrowed(&res)) {
-        let rd = r.GetDesc();
-        let made = super::device_x::pc_depth_view_format(rd.Format.0 as u32, c.Format.0 as u32);
-        trace_depth_view("depth", res, &rd, desc.as_ref().map_or(0, |d| d.Format.0), made as i32);
-        c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(made as i32);
+    if crate::util::mac_host() {
+        if let (Some(c), Some(r)) = (copy.as_mut(), ID3D12Resource::from_raw_borrowed(&res)) {
+            let rd = r.GetDesc();
+            let made = super::device_x::pc_depth_view_format(rd.Format.0 as u32, c.Format.0 as u32);
+            trace_depth_view("depth", res, &rd, desc.as_ref().map_or(0, |d| d.Format.0), made as i32);
+            c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(made as i32);
+        }
     }
     f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu)
 }
@@ -2080,7 +2096,7 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
 /// cannot make ends the process there (D3DMetal: Metal's texture assertion).
 unsafe fn trace_depth_view(kind: &str, res: *mut c_void, rd: &D3D12_RESOURCE_DESC, asked: i32, made: i32) {
     static ON: OnceLock<bool> = OnceLock::new();
-    if !matches!(rd.Format.0, 19..=22 | 39..=41 | 44..=47 | 53..=56) || !*ON.get_or_init(|| std::env::var_os("XCL_TRACE_DEPTH_VIEWS").is_some()) {
+    if !crate::util::mac_host() || !matches!(rd.Format.0, 19..=22 | 39..=41 | 44..=47 | 53..=56) || !*ON.get_or_init(|| std::env::var_os("XCL_TRACE_DEPTH_VIEWS").is_some()) {
         return;
     }
     crate::xlog_info!(
@@ -2174,8 +2190,10 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     if let Some(v) = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| pc_srv(&r.GetDesc(), copy.as_ref())) {
         copy = Some(v);
     }
-    if let Some(r) = ID3D12Resource::from_raw_borrowed(&res) {
-        trace_depth_view("shader", res, &r.GetDesc(), desc.as_ref().map_or(0, |d| d.Format.0), copy.as_ref().map_or(0, |c| c.Format.0));
+    if crate::util::mac_host() {
+        if let Some(r) = ID3D12Resource::from_raw_borrowed(&res) {
+            trace_depth_view("shader", res, &r.GetDesc(), desc.as_ref().map_or(0, |d| d.Format.0), copy.as_ref().map_or(0, |c| c.Format.0));
+        }
     }
     let desc = copy.as_ref().map_or(desc, |c| c as *const _);
     let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, desc, cpu) };
@@ -2630,7 +2648,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         Kind::DescriptorHeap => v.push(("Release", heap_release as usize)),
         Kind::Heap => v.push(("Release", mem_heap_release as usize)),
         Kind::Fence => v.push(("Signal", fence_signal as usize)),
-        Kind::CommandSignature => v.push(("Release", signature_release as usize)),
+        Kind::CommandSignature if crate::util::mac_host() => v.push(("Release", signature_release as usize)),
         _ => {}
     }
     v
@@ -2887,7 +2905,13 @@ pub(super) unsafe fn create_raw_pc_command_list(
         }
         hr
     };
-    (hr >= 0 && !out.is_null()).then_some(out)
+    if hr < 0 || out.is_null() {
+        return None;
+    }
+    if crate::util::mac_host() {
+        super::alloc_pool::created_on(out as usize, alloc, ty.0);
+    }
+    Some(out)
 }
 creator!(dev_create_descriptor_heap, "CreateDescriptorHeap", Kind::DescriptorHeap, [a1]);
 creator!(dev_create_committed_resource, "CreateCommittedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
@@ -3327,6 +3351,10 @@ struct Dummy {
 /// second output changes nothing.
 const STANDIN_PS: &str = "struct O { float4 c0 : SV_Target0; float4 c1 : SV_Target1; };\nO main() { O o; o.c0 = float4(1, 0, 1, 1); o.c1 = float4(0, 0, 0, 0); return o; }\n";
 
+fn standin_ps(mac: bool) -> &'static str {
+    if mac { STANDIN_PS } else { "float4 main() : SV_Target { return float4(1, 0, 1, 1); }\n" }
+}
+
 /// Stand-in mesh shader and pixel shader (DXIL, as mesh pipelines need): one degenerate
 /// triangle (DXC wants every output written), nothing drawn.
 fn dummy_mesh() -> Option<&'static (Vec<u8>, Vec<u8>)> {
@@ -3334,7 +3362,7 @@ fn dummy_mesh() -> Option<&'static (Vec<u8>, Vec<u8>)> {
     D.get_or_init(|| {
         use crate::gpu::recomp::dxc::compile;
         let ms = "struct V { float4 p : SV_Position; };\n[outputtopology(\"triangle\")]\n[numthreads(1, 1, 1)]\nvoid main(out vertices V v[1], out indices uint3 t[1]) { SetMeshOutputCounts(1, 1); v[0].p = float4(0, 0, 0, 1); t[0] = uint3(0, 0, 0); }\n";
-        match (compile(ms, "main", "ms_6_5", &[]), compile(STANDIN_PS, "main", "ps_6_0", &[])) {
+        match (compile(ms, "main", "ms_6_5", &[]), compile(standin_ps(crate::util::mac_host()), "main", "ps_6_0", &[])) {
             (Ok(m), Ok(p)) => Some((m, p)),
             (m, p) => {
                 crate::xlog_warn!("D3D12.X: stand-in mesh shaders: {:?} {:?}", m.err(), p.err());
@@ -3375,7 +3403,7 @@ fn dummy() -> &'static Dummy {
     D.get_or_init(|| {
         // On a native host DXIL from DXC first: a host that turns DXIL into its own shaders
         // (Apple's D3DMetal) has nothing for a DXBC stand-in; the old compiler is the fallback.
-        let native = crate::gpu::shader::NATIVE_HOST_MEMORY.load(Ordering::Relaxed);
+        let native = crate::util::mac_host() && crate::gpu::shader::NATIVE_HOST_MEMORY.load(Ordering::Relaxed);
         let both = |src: &str, new: &str, old: &str| match native.then(|| crate::gpu::recomp::dxc::compile(src, "main", new, &[])) {
             Some(Ok(b)) if !b.is_empty() => b,
             Some(r) => {
@@ -3386,7 +3414,7 @@ fn dummy() -> &'static Dummy {
         };
         Dummy {
             vs: both("float4 main(uint id : SV_VertexID) : SV_Position { return float4(0, 0, 0, 1); }", "vs_6_0", "vs_5_0"),
-            ps: both(STANDIN_PS, "ps_6_0", "ps_5_0"),
+            ps: both(standin_ps(crate::util::mac_host()), "ps_6_0", "ps_5_0"),
             cs: both("[numthreads(1, 1, 1)] void main() {}", "cs_6_0", "cs_5_0"),
         }
     })
@@ -3473,7 +3501,9 @@ fn host_shader(blob: &[u8]) -> bool {
 /// E_INVALIDARG as Windows' D3D12 does, its process ends inside the unwinder instead
 /// (CrossOver 26.3; XCL's test title's console-container PS). The stand-in fallback follows.
 unsafe fn refused_on_mac_host(g: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> bool {
-    crate::util::mac_host() && [&g.VS, &g.PS, &g.DS, &g.HS, &g.GS].into_iter().filter_map(|b| shader_bytes(b)).any(|s| !host_shader(s))
+    crate::util::mac_host() && [&g.VS, &g.PS, &g.DS, &g.HS, &g.GS].into_iter().any(|b| {
+        (!b.pShaderBytecode.is_null() || b.BytecodeLength != 0) && shader_bytes(b).is_none_or(|s| !host_shader(s))
+    })
 }
 
 /// Root signature of every pipeline built from translated console shaders (static samplers
@@ -4754,7 +4784,7 @@ unsafe fn untranslated_stream_desc(desc: *const c_void, stream: bool) -> Option<
 /// the GS a rect's fourth corner is made on the CPU (`bind::draw_rects`), which is what ran there.
 fn rect_list_gs_allowed() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("XCL_RECT_LIST_GS") {
+    !crate::util::mac_host() || *ON.get_or_init(|| match std::env::var("XCL_RECT_LIST_GS") {
         Ok(v) => v.trim() != "0",
         Err(_) => !crate::gpu::shader::NATIVE_HOST_MEMORY.load(Ordering::Relaxed),
     })
@@ -5140,7 +5170,6 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     if n == 0 {
         super::alloc_pool::forget(this as usize);
         super::list_x::on_allocator_release(this as usize);
-        super::indirect::allocator_reset(this as usize);
     }
     n
 }
@@ -5154,14 +5183,20 @@ pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
 
 unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
     // (lists may still hold recordings on it that the title submits again: `alloc_pool`)
-    let hr = match super::alloc_pool::title_reset(this) {
-        Some(hr) => hr,
-        None => reset_pc_allocator(this),
+    let (hr, backing) = match super::alloc_pool::title_reset(this) {
+        Some(result) => result,
+        None => (reset_pc_allocator(this), Some(this as usize)),
     };
     if hr >= 0 {
-        // the GPU is done with what lists recorded from this allocator used
-        super::console_list::allocator_reset(this);
-        super::indirect::allocator_reset(this as usize);
+        if crate::util::mac_host() {
+            // A successful title Reset may have kept the previous recordings alive.
+            if let Some(backing) = backing {
+                super::console_list::allocator_reset(backing as *mut c_void);
+                super::indirect::allocator_reset(backing);
+            }
+        } else {
+            super::console_list::allocator_reset(this);
+        }
     }
     hr
 }
@@ -5170,7 +5205,7 @@ unsafe extern "system" fn signature_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
-        super::indirect::forget(this as usize);
+        super::bind::forget_mac_signatures(this as usize);
     }
     n
 }
@@ -5311,7 +5346,7 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
         // count, 0) – which pool pages the GPU sees at the addresses a title places its pool's
         // resources at (`gpu_views`; as a stub the textures there that the pairing of the two
         // reservations does not reach read as zeros: a retail game's menu images)
-        29 if shifted => {
+        29 if shifted && crate::util::mac_host() => {
             super::gpu_views::update(a1 as u32, a2 as *const u8, a3, a4 as u32);
             0
         }
@@ -5672,9 +5707,12 @@ mod standin_tests {
         let targets = |b: &[u8]| -> Vec<u32> {
             crate::gpu::dxbc::signatures(b).1.iter().filter(|e| e.name.eq_ignore_ascii_case("SV_Target")).map(|e| e.index).collect()
         };
-        assert_eq!(targets(&dummy().ps), [0, 1], "the DXBC stand-in");
+        assert_eq!(targets(&compile(standin_ps(true), "ps_5_0")), [0, 1], "the Mac stand-in");
+        assert_eq!(targets(&compile(standin_ps(false), "ps_5_0")), [0], "the upstream stand-in");
+        let expected = if crate::util::mac_host() { vec![0, 1] } else { vec![0] };
+        assert_eq!(targets(&dummy().ps), expected);
         match dummy_mesh() {
-            Some((_, ps)) => assert_eq!(targets(ps), [0, 1], "the DXIL stand-in of mesh pipelines"),
+            Some((_, ps)) => assert_eq!(targets(ps), expected, "the DXIL stand-in of mesh pipelines"),
             None => crate::gpu::recomp::runner::skip_test("no DXC"),
         }
     }

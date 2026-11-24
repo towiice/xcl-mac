@@ -433,9 +433,13 @@ pub fn get_proc_address(h: usize, what: &ImportName) -> Option<usize> {
         let full = String::from_utf16_lossy(&buf[..n as usize]);
         let key = dll_key(&full);
         if let Some(m) = reg.hle_for(&key) {
-            // by name, or by an ordinal the module knows (ws2_32's: a lookup by number must not
-            // reach the host's connect while the network is off)
-            if let Some(&a) = hle_name_for(m, &key, what).and_then(|name| m.exports.get(name)) {
+            let name = match what {
+                ImportName::Name { name, .. } => Some(name.as_str()),
+                // Winsock ordinals must resolve to the offline shims on the Mac host too.
+                ImportName::Ordinal(_) if crate::util::mac_host() => hle_name_for(m, &key, what),
+                ImportName::Ordinal(_) => None,
+            };
+            if let Some(&a) = name.and_then(|name| m.exports.get(name)) {
                 return Some(a);
             }
         }

@@ -30,7 +30,7 @@ pub unsafe extern "system" fn SetUnhandledExceptionFilter(f: usize) -> usize {
 }
 
 pub fn exports() -> Vec<(&'static str, usize)> {
-    crate::hle_exports![
+    let mut exports = crate::hle_exports![
         // registry: the console mode the GDK thunks read (XSystemGetDeviceType)
         RegOpenKeyW,
         RegOpenKeyExW,
@@ -48,7 +48,6 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XMemAllocDefault,
         XMemFreeDefault,
         XMemSetAllocationHooks,
-        CreateThread,
         XMemVirtualQuery,
         XMemVirtualAlloc,
         XMemAllocatePhysicalPages,
@@ -56,7 +55,6 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XMemMapPhysicalPagesScatter,
         XMemFreePhysicalPages,
         XMemTransferMemory,
-        XMemIsToolsMemAvailable,
         XMemGetWorkingSetStatistics,
         TitleMemoryStatus,
         JobTitleMemoryStatus,
@@ -97,7 +95,11 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         FreeLibrary,
         FreeLibraryWhenCallbackReturns,
         DisableThreadLibraryCalls,
-    ]
+    ];
+    if crate::util::mac_host() {
+        exports.extend(crate::hle_exports![CreateThread, XMemIsToolsMemAvailable]);
+    }
+    exports
 }
 
 // ---------------------------------------------------------------------------------------
@@ -293,10 +295,14 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             trace_mem("VirtualAlloc (graphics reserve, UMA)", 0, size, t as u64, p, q as usize);
             return q as *mut c_void;
         }
-        let q = mem::VirtualAlloc(addr, size, mem::MEM_RESERVE | MEM_WRITE_WATCH, sanitize_protect(p));
+        let watched = watched_fallback();
+        let flags = if watched { mem::MEM_RESERVE | MEM_WRITE_WATCH } else { mem::MEM_RESERVE };
+        let q = mem::VirtualAlloc(addr, size, flags, sanitize_protect(p));
         if !q.is_null() {
-            GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
-            GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+            if watched {
+                GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
+                GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+            }
             return q;
         }
     }
@@ -332,7 +338,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     // there are compared by content (`title_textures::poll_unwatched`).
     if gpu_visible_fallback(addr, t, p) {
         let watched = watched_fallback();
-        let q = if watched { reserve_watched(size, t, p) } else { mem::VirtualAlloc(std::ptr::null(), size, sanitize_alloc_type(t), sanitize_protect(p)) };
+        let q = if watched { reserve_watched(size, t, p) } else { mem::VirtualAlloc(std::ptr::null(), size, sanitize_alloc_type(t) & !MEM_WRITE_WATCH, sanitize_protect(p)) };
         if !q.is_null() {
             mirrors::reserved(q as usize, size, t, p);
             trace_mem(if watched { "VirtualAlloc (GPU-visible, write-watched)" } else { "VirtualAlloc (GPU-visible, plain)" }, addr as usize, size, t as u64, p, q as usize);
@@ -364,17 +370,14 @@ unsafe fn reserve_watched(size: usize, t: u32, p: u32) -> *mut c_void {
 }
 
 /// Whether GPU-visible title memory that reaches the plain-memory fallback is write-watched:
-/// `XCL_WATCHED_FALLBACK=1` / `0`, else everywhere but on a Mac (`util::mac_host`). The title's
+/// Always on native Windows, opt-in with `XCL_WATCHED_FALLBACK=1` on a Mac. The title's
 /// heaps and its 24 GB of 64 KiB pages are in that memory, written with AVX2 masked stores,
 /// and Wine keeps a write watch by protecting pages: Rosetta cannot resume such a store after
 /// its fault (as with `coherent_heaps`). Textures there are compared by content instead
 /// (`title_textures::poll_unwatched`); a GPU view is still paired with its CPU view (`mirrors`).
 pub(crate) fn watched_fallback() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("XCL_WATCHED_FALLBACK") {
-        Ok(v) => v.trim() != "0",
-        Err(_) => !crate::util::mac_host(),
-    })
+    !crate::util::mac_host() || *ON.get_or_init(|| std::env::var("XCL_WATCHED_FALLBACK").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// Whether the title's GPU heaps go to the coherent window: `XCL_COHERENT_HEAPS=1` / `0`, else
@@ -388,10 +391,10 @@ pub(crate) fn watched_fallback() -> bool {
 /// index and vertex buffers in them are mirrored (`list_x::gpu_va`), buffer views get an empty V#.
 fn coherent_heaps() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("XCL_COHERENT_HEAPS") {
-        Ok(v) => v.trim() != "0",
-        Err(_) => !crate::util::mac_host(),
-    })
+    if !crate::util::mac_host() {
+        return std::env::var("XCL_COHERENT_HEAPS").map_or(true, |v| v != "0");
+    }
+    *ON.get_or_init(|| std::env::var("XCL_COHERENT_HEAPS").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// PAGE_GRAPHICS_NOACCESS … PAGE_GRAPHICS_NOCACHE (0x800 – 0x40000): the console's protection of
@@ -481,10 +484,13 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
     }
     let ok = mem::VirtualFree(addr, size, t);
     if ok != 0 && t & 0x8000 != 0 {
-        // (a GPU-visible reservation that is not write-watched is paired too, `watched_fallback`)
-        mirrors::released(addr as usize);
-        if GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
+        let watched = GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some();
+        if watched {
             GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+        }
+        // A Mac's GPU-visible reservation can be paired without being write-watched.
+        if watched || crate::util::mac_host() {
+            mirrors::released(addr as usize);
         }
     }
     ok
@@ -1016,16 +1022,26 @@ pub unsafe fn read_physical_pages(pages: &[usize], offset: usize, dst: &mut [u8]
 /// Copy `src` into `pages` starting at `offset` within the first page. Validates every page
 /// before writing so the destination gets all bytes or nothing.
 pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -> bool {
-    if src.is_empty() {
+    write_physical_pages_with(pages, offset, src.len(), |dst, done, len| {
+        std::ptr::copy_nonoverlapping(src.as_ptr().add(done), dst, len);
+    })
+}
+
+/// Visit the writable chunks of a physical-page range. All page numbers are resolved before
+/// the first write, and the addresses stay mapped until the callback has returned.
+pub(super) unsafe fn write_physical_pages_with(
+    pages: &[usize], offset: usize, len: usize, mut write: impl FnMut(*mut u8, usize, usize),
+) -> bool {
+    if len == 0 {
         return offset < PHYS_PAGE;
     }
     let g = AWAY.lock().unwrap();
-    let Some(addrs) = resolve_physical_pages(g.as_ref(), pages, offset, src.len()) else { return false };
+    let Some(addrs) = resolve_physical_pages(g.as_ref(), pages, offset, len) else { return false };
     let mut done = 0;
     let mut page_off = offset;
     for addr in addrs {
-        let chunk = (PHYS_PAGE - page_off).min(src.len() - done);
-        std::ptr::copy_nonoverlapping(src.as_ptr().add(done), (addr + page_off) as *mut u8, chunk);
+        let chunk = (PHYS_PAGE - page_off).min(len - done);
+        write((addr + page_off) as *mut u8, done, chunk);
         done += chunk;
         page_off = 0;
     }
@@ -1152,8 +1168,10 @@ struct StateRun {
 
 /// `committed_page`, remembering in `run` the state of the pages around `a`.
 fn committed_page_in(a: usize, run: &mut StateRun) -> bool {
-    if let Some(c) = crate::hle::d3d12x::sparse::page_committed(a) {
-        return c;
+    if crate::util::mac_host() {
+        if let Some(c) = crate::hle::d3d12x::sparse::page_committed(a) {
+            return c;
+        }
     }
     if (run.start..run.end).contains(&a) {
         return run.committed;
@@ -1233,21 +1251,17 @@ unsafe fn release_at(at: usize) {
 /// at a time after its first movie spent 20 s in them and its watchdog ended it. False: the page
 /// was never used at `old` (its home holds it, zeros) and is not mapped anywhere now.
 unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma: bool) -> Result<bool, ()> {
+    if old == at {
+        return Ok(true);
+    }
     if lazy::unmark(old) {
         away.at.remove(&old);
         away.page.remove(&page);
         return Ok(false);
     }
-    if old == at {
-        return Ok(true);
-    }
     // (a destination that cannot be committed leaves the page where it was, mapped as before)
-    if !in_uma {
-        let mut old_prot = 0;
-        let _ = mem::VirtualProtect(at as *const c_void, PHYS_PAGE, mem::PAGE_READWRITE, &mut old_prot);
-        if mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
-            return Err(());
-        }
+    if !in_uma && !commit_mapping_destination(at) {
+        return Err(());
     }
     away.at.remove(&old);
     away.page.remove(&page);
@@ -1255,10 +1269,30 @@ unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma:
     if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
         crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
     }
+    // Do not map the GPU tiles for a destination from earlier in this call after releasing it.
+    away.arrived.retain(|&a| a != old);
     release_at(old);
     away.at.insert(at, page);
     away.page.insert(page, at);
     Ok(true)
+}
+
+/// Wine can leave an already committed destination protected as a view after recommit.
+unsafe fn commit_mapping_destination(at: usize) -> bool {
+    let commit = || !mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null();
+    if !crate::util::mac_host() {
+        return commit();
+    }
+    let mut old = 0;
+    let writable = mem::VirtualProtect(at as *const c_void, PHYS_PAGE, mem::PAGE_READWRITE, &mut old) != 0;
+    if !commit() {
+        if writable {
+            let _ = mem::VirtualProtect(at as *const c_void, PHYS_PAGE, old, &mut 0);
+        }
+        return false;
+    }
+    // The first protect can fail on reserved pages. Verify protection after committing them.
+    writable || mem::VirtualProtect(at as *const c_void, PHYS_PAGE, mem::PAGE_READWRITE, &mut old) != 0
 }
 
 pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, num: *mut usize, arr: *mut usize) -> BOOL {
@@ -1357,6 +1391,10 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
     }
+    let Some(bytes) = n.checked_mul(PHYS_PAGE).filter(|&bytes| (va as usize).checked_add(bytes).is_some()) else {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    };
     let pages: Vec<usize> = if arr.is_null() { vec![0; n] } else { (0..n).map(|i| *arr.add(i)).collect() };
     if pages.iter().any(|&p| p != 0 && page_home(p).is_none()) {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
@@ -1375,10 +1413,11 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             return std::ptr::null_mut();
         }
         // (pages this call moved away and back are home again, not given back)
-        away.gone.retain(|&h| h < home || h >= home + n * PHYS_PAGE);
+        let homes = home..home + bytes;
+        away.gone.retain(|h| !homes.contains(h));
         for &p in &pages {
             if let Some(&at) = away.page.get(&p) {
-                unmap_away(away, at, &(home..home + n * PHYS_PAGE));
+                unmap_away(away, at, &homes);
                 away.ghost.insert(at, p);
             }
         }
@@ -1433,13 +1472,9 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             away.page.insert(p, at);
             continue;
         }
-        if !in_uma(at) {
-            let mut old = 0;
-            let _ = mem::VirtualProtect(at as *const c_void, PHYS_PAGE, mem::PAGE_READWRITE, &mut old);
-            if mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
-                fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
-                return std::ptr::null_mut();
-            }
+        if !in_uma(at) && !commit_mapping_destination(at) {
+            fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
+            return std::ptr::null_mut();
         }
         if committed_page(home) {
             std::ptr::copy_nonoverlapping(home as *const u8, at as *mut u8, PHYS_PAGE);
@@ -1450,10 +1485,14 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             std::ptr::write_bytes(at as *mut u8, 0, PHYS_PAGE); // a page never used: zeros
         }
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
-            away.arrived.push(at);
-            // (in runs of 256 MB, so a page unmapped again in the same call is found quickly)
-            if away.arrived.len() >= 4096 {
-                tell_arrived(away);
+            if crate::util::mac_host() {
+                away.arrived.push(at);
+                // (in runs of 256 MB, so a page unmapped again in the same call is found quickly)
+                if away.arrived.len() >= 4096 {
+                    tell_arrived(away);
+                }
+            } else {
+                crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
             }
         }
         away.at.insert(at, p);
@@ -2649,13 +2688,36 @@ mod tests {
             let at = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
             mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE);
             let page = 0x7E57_0000usize;
-            let mut away = Away { at: Default::default(), page: Default::default(), gone: Vec::new() };
+            let mut away = Away::default();
             away.at.insert(old, page);
             away.page.insert(page, old);
             assert!(move_away(&mut away, old, at, page, false).is_err());
             assert_eq!(away.page.get(&page), Some(&old), "the page lost where it is");
             assert_eq!(away.at.get(&old), Some(&page));
             assert_eq!(*(old as *const u32), 7);
+            mem::VirtualFree(old as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn moving_a_page_cancels_its_earlier_deferred_arrival() {
+        unsafe {
+            let old = mem::VirtualAlloc(std::ptr::null(), 2 * PHYS_PAGE, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) as usize;
+            assert_ne!(old, 0);
+            let at = old + PHYS_PAGE;
+            let page = 0x7E57_0000usize;
+            *(old as *mut u32) = 7;
+            let mut away = Away::default();
+            away.at.insert(old, page);
+            away.page.insert(page, old);
+            away.arrived.push(old);
+
+            assert_eq!(move_away(&mut away, old, old, page, false), Ok(true));
+            assert_eq!(away.arrived, vec![old]);
+            assert_eq!(move_away(&mut away, old, at, page, false), Ok(true));
+            assert!(away.arrived.is_empty());
+            assert_eq!(away.page.get(&page), Some(&at));
+            assert_eq!(*(at as *const u32), 7);
             mem::VirtualFree(old as *mut c_void, 0, mem::MEM_RELEASE);
         }
     }

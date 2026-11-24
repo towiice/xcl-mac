@@ -395,7 +395,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     }
     let in_gpu_view = crate::hle::kernelx::mirrors::source(va).is_some();
     let size = tex.size() as usize;
-    let unwatched = !is_watched(src, size);
+    let unwatched = crate::util::mac_host() && !is_watched(src, size);
     if unwatched {
         note_unwatched(res, src, size);
     } else if trace_unwatched() {
@@ -485,7 +485,7 @@ fn recheck_source(e: &mut Entry) -> bool {
         return false;
     }
     e.src = src;
-    e.unwatched = !is_watched(src, e.tex.size() as usize);
+    e.unwatched = crate::util::mac_host() && !is_watched(src, e.tex.size() as usize);
     if !e.pending {
         e.pending = true;
         PENDING.fetch_add(1, Ordering::Relaxed);
@@ -805,7 +805,8 @@ unsafe fn refresh_once(queue: *mut c_void) {
         });
     }
     // textures in memory that is not write-watched: by content
-    let mut todo = poll_unwatched();
+    let on_mac = crate::util::mac_host();
+    let mut todo = if on_mac { poll_unwatched() } else { Vec::new() };
     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
         upload_all(todo);
         return;
@@ -837,7 +838,8 @@ unsafe fn refresh_once(queue: *mut c_void) {
                     }
                 }
                 let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.va, Arc::clone(&e.tex), e.states.clone())))
+                let source = if on_mac { e.va } else { e.src };
+                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, source, Arc::clone(&e.tex), e.states.clone())))
             })
             .collect()
     });
@@ -1029,14 +1031,15 @@ pub(super) unsafe fn memory_hash_for_tests(at: usize, len: usize) -> u64 {
 /// asks Windows about a region once.
 unsafe fn memory_hash_in(memory: &mut TitleMemory, at: usize, len: usize) -> u64 {
     const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let Some(limit) = at.checked_add(len) else { return 0 };
     let mut l = [K, K.rotate_left(13), K.rotate_left(29), K.rotate_left(47)];
+    let mut snapshot = [0u8; TitleMemory::PAGE];
     let mut p = at;
-    while p < at + len {
+    while p < limit {
         let (src, same) = memory.locate(p);
-        let n = same.min(at + len - p);
-        if src != 0 {
-            let b = std::slice::from_raw_parts(src as *const u8, n);
-            let mut chunks = b.chunks_exact(32);
+        let n = same.min(limit - p);
+        if src != 0 && copy_committed_region(src, snapshot.as_mut_ptr(), n) {
+            let mut chunks = snapshot[..n].chunks_exact(32);
             for c in &mut chunks {
                 for (i, lane) in l.iter_mut().enumerate() {
                     let w = u64::from_le_bytes(c[8 * i..8 * i + 8].try_into().unwrap());
@@ -1089,16 +1092,16 @@ unsafe fn poll_unwatched() -> Vec<(ID3D12Resource, Upload)> {
     static CURSORS: Mutex<[usize; 3]> = Mutex::new([0; 3]);
     let frame = frame_now();
     let new_frame = LAST_FRAME.swap(frame, Ordering::Relaxed) != frame;
-    // (texture, address, bytes, hash last sent)
-    let (look, count, total): (Vec<(usize, usize, usize, u64)>, usize, usize) = {
+    // (texture, registration sequence, address, bytes, hash last sent)
+    let (look, count, total) = {
         let mut t = TEXTURES.lock().unwrap();
         let mut all: Vec<Seen> = Vec::new();
-        let mut places: Vec<(usize, u64)> = Vec::new();
+        let mut places = Vec::new();
         for (&res, e) in t.by_res.iter_mut() {
-            let now = std::mem::take(&mut e.cpu_unmapped);
             if !e.unwatched || e.pending || e.gpu_written {
                 continue;
             }
+            let now = std::mem::take(&mut e.cpu_unmapped);
             let size = e.tex.size() as usize;
             let pool = e.in_gpu_view || super::gpu_views::in_range(e.va, size);
             if pool && e.dynamic && frame.saturating_sub(e.changed) >= POOL_FRAMES {
@@ -1106,24 +1109,28 @@ unsafe fn poll_unwatched() -> Vec<(ID3D12Resource, Upload)> {
                 e.dynamic = false;
             }
             all.push(Seen { key: res, size, dynamic: e.dynamic, mapped: e.mapped, now, changed: e.changed, made: e.made, pool });
-            places.push((e.va, e.sent));
+            places.push((e.seq, e.va, e.sent));
         }
         let picked = pick(&all, frame, new_frame, &mut CURSORS.lock().unwrap());
-        (picked.into_iter().map(|i| (all[i].key, places[i].0, all[i].size, places[i].1)).collect(), all.len(), all.iter().map(|e| e.size).sum())
+        let look: Vec<_> = picked.into_iter().map(|i| {
+            let (seq, va, sent) = places[i];
+            (all[i].key, seq, va, all[i].size, sent)
+        }).collect();
+        (look, all.len(), all.iter().map(|e| e.size).sum::<usize>())
     };
     UNWATCHED.store(count as u64, Ordering::Relaxed);
     if look.is_empty() {
         return Vec::new();
     }
     let t0 = std::time::Instant::now();
-    let mut changed: Vec<(usize, u64)> = Vec::new();
+    let mut changed = Vec::new();
     let mut hashed = 0usize;
     let mut memory = TitleMemory::new();
-    for &(res, va, size, sent) in &look {
+    for &(res, seq, va, size, sent) in &look {
         let h = memory_hash_in(&mut memory, va, size);
         hashed += size;
         if h != sent {
-            changed.push((res, h));
+            changed.push((res, seq, h));
         }
     }
     HASHED.fetch_add(hashed as u64, Ordering::Relaxed);
@@ -1146,9 +1153,9 @@ unsafe fn poll_unwatched() -> Vec<(ID3D12Resource, Upload)> {
     let mut t = TEXTURES.lock().unwrap();
     changed
         .into_iter()
-        .filter_map(|(res, h)| {
-            let e = t.get_mut(res)?;
-            if e.gpu_written {
+        .filter_map(|(res, seq, h)| {
+            let e = t.by_res.get_mut(&res)?;
+            if e.seq != seq || !e.unwatched || e.pending || e.gpu_written {
                 return None;
             }
             e.sent = h;
@@ -1413,39 +1420,44 @@ fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> 
     out
 }
 
-/// Copy `[src, src + len)` into `dst` (pre-zeroed) without faulting if another thread unmaps or
+/// Copy `[src, src + len)` into `dst` without faulting if another thread unmaps or
 /// decommits a page concurrently: `ReadProcessMemory` catches the fault in kernel mode and returns
 /// `0`. Because Windows may return `read == 0` when a fault occurs later in the span, binary-split
 /// failed multi-page ranges at 4 KiB boundaries so all still-committed pages are copied in O(log N)
-/// calls and only unreadable pages stay zeroed.
-unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) {
+/// calls and only unreadable pages retain their existing values. Returns true when all bytes
+/// were copied.
+unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     const PAGE: usize = 0x1000;
 
-    unsafe fn copy_rec(proc: *mut c_void, src: usize, dst: *mut u8, len: usize) {
+    unsafe fn copy_rec(proc: *mut c_void, src: usize, dst: *mut u8, len: usize) -> bool {
         if len == 0 {
-            return;
+            return true;
         }
         let mut read = 0usize;
-        if ReadProcessMemory(proc, src as *const c_void, dst as *mut c_void, len, &mut read) != 0 {
-            return;
+        if ReadProcessMemory(proc, src as *const c_void, dst as *mut c_void, len, &mut read) != 0 && read == len {
+            return true;
         }
         let read = read.min(len);
         let src = src + read;
         let dst = dst.add(read);
         let len = len - read;
+        if len == 0 {
+            return true;
+        }
         let page_end = (src & !(PAGE - 1)).saturating_add(PAGE).min(src + len);
         if page_end == src + len {
-            return;
+            return false;
         }
         let mid = ((src + len / 2) & !(PAGE - 1)).max(page_end);
         let left = mid - src;
-        copy_rec(proc, src, dst, left);
-        copy_rec(proc, mid, dst.add(left), len - left);
+        let left_ok = copy_rec(proc, src, dst, left);
+        let right_ok = copy_rec(proc, mid, dst.add(left), len - left);
+        left_ok && right_ok
     }
 
-    copy_rec(GetCurrentProcess(), src, dst, len);
+    src.checked_add(len).is_some() && copy_rec(GetCurrentProcess(), src, dst, len)
 }
 
 /// `len` bytes at `at`: the committed, readable pages copied, the rest zero (a streaming pool
@@ -1460,7 +1472,23 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
         std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
         return out;
     }
-    TitleMemory::new().read(at, out.as_mut_ptr(), len);
+    if crate::util::mac_host() {
+        TitleMemory::new().read(at, out.as_mut_ptr(), len);
+    } else {
+        let mut region = (0, 0, false);
+        let mut p = at;
+        while p < limit {
+            let (end, readable) = TitleMemory::region(&mut region, p);
+            let end = end.min(limit);
+            if end <= p {
+                break;
+            }
+            if readable {
+                copy_committed_region(p, out.as_mut_ptr().add(p - at), end - p);
+            }
+            p = end;
+        }
+    }
     out
 }
 
@@ -1511,7 +1539,9 @@ unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> V
 /// The title's bytes at `at`: where they are when all of them are readable (a copy first cost
 /// as much as the detile of a video frame), else read page run by page run.
 unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> {
-    if crate::gpu::shader::readable(at, len) {
+    if (!crate::util::mac_host() && crate::gpu::shader::readable(at, len))
+        || crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len))
+    {
         std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
     } else {
         std::borrow::Cow::Owned(read_committed(at, len))
@@ -1611,9 +1641,9 @@ impl TitleMemory {
             let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
             *cache = if VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0 {
                 // R / RW / WC / X-R…, no guard
-                (m.BaseAddress as usize, m.BaseAddress as usize + m.RegionSize, m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0)
+                (m.BaseAddress as usize, (m.BaseAddress as usize).saturating_add(m.RegionSize), m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0)
             } else {
-                (a & !0xFFF, (a & !0xFFF) + 0x1000, false)
+                (a & !0xFFF, (a & !0xFFF).saturating_add(0x1000), false)
             };
         }
         (cache.1, cache.2)
@@ -1629,7 +1659,7 @@ impl TitleMemory {
         // (a view's page is whole: 64 KiB the title mapped at once)
         let whole = |m: &mut TitleMemory, a: usize| {
             let (end, ok) = Self::region(&mut m.source, a);
-            ok && end >= a + Self::PAGE
+            ok && a.checked_add(Self::PAGE).is_some_and(|limit| end >= limit)
         };
         let (place, how) = match mapped {
             Some(Some(at)) if whole(self, at) => (Place::At(at), if paired == Some(at) { BY_QUEUE_SAME } else { BY_QUEUE_OTHER }),
@@ -1649,15 +1679,16 @@ impl TitleMemory {
     /// place (at least 1).
     unsafe fn locate(&mut self, at: usize) -> (usize, usize) {
         let page = at & !(Self::PAGE - 1);
+        let limit = page.saturating_add(Self::PAGE);
         if self.page.0 != page {
             self.page = (page, self.place(page));
         }
         match self.page.1 {
-            Place::At(src) => (src + (at - page), page + Self::PAGE - at),
-            Place::Nowhere => (0, page + Self::PAGE - at),
+            Place::At(src) => (src + (at - page), limit - at),
+            Place::Nowhere => (0, limit - at),
             Place::Own => {
                 let (end, ok) = Self::region(&mut self.direct, at);
-                (if ok { at } else { 0 }, end.min(page + Self::PAGE).max(at + 1) - at)
+                (if ok { at } else { 0 }, end.min(limit).max(at + 1) - at)
             }
         }
     }
@@ -1665,13 +1696,16 @@ impl TitleMemory {
     /// `n` bytes at `at` to `dst`; what is nowhere stays as `dst` has it. Returns whether all
     /// of it was read.
     unsafe fn read(&mut self, mut at: usize, mut dst: *mut u8, mut n: usize) -> bool {
+        if at.checked_add(n).is_none() {
+            return false;
+        }
         let mut all = true;
         while n > 0 {
             let (src, same) = self.locate(at);
             let chunk = n.min(same);
             match src {
                 0 => all = false,
-                src => std::ptr::copy_nonoverlapping(src as *const u8, dst, chunk),
+                src => all &= copy_committed_region(src, dst, chunk),
             }
             at += chunk;
             dst = dst.add(chunk);
@@ -2003,7 +2037,7 @@ mod tests {
             // no mapping by the queue: the pairing
             assert_eq!(read(gpu + 2 * PAGE + 8), (0xA0A0_0000, true));
             assert_eq!(read(gpu + 3 * PAGE + 8), (0, false), "nothing in either view");
-            assert_eq!(read_committed(gpu + 2 * PAGE, 16)[8..12], 0xA0A0_0000u32.to_le_bytes());
+            assert_eq!(read_memory(gpu + 2 * PAGE, 16).0[8..12], 0xA0A0_0000u32.to_le_bytes());
             // the queue maps pool page 1 at page 2 of the GPU view and pool page 0 at page 3
             let ranges = [[1u32, 1, 1], [1, 0, 1]];
             let batch: [usize; 3] = [gpu + 2 * PAGE, 2, ranges.as_ptr() as usize];
@@ -2725,6 +2759,24 @@ mod tests {
             stop.store(true, Ordering::Relaxed);
             mutator.join().unwrap();
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn title_memory_rejects_a_page_decommitted_after_its_lookup() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const PAGE: usize = 0x1000;
+        unsafe {
+            let at = VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(at, 0);
+            let mut reader = TitleMemory::new();
+            assert_eq!(reader.locate(at).0, at);
+            assert_ne!(VirtualFree(at as *mut c_void, PAGE, MEM_DECOMMIT), 0);
+            let mut out = [0u8; 16];
+            assert!(!reader.read(at, out.as_mut_ptr(), out.len()));
+            assert_eq!(out, [0u8; 16]);
+            assert!(!reader.read(usize::MAX - 1, out.as_mut_ptr(), out.len()));
+            VirtualFree(at as *mut c_void, 0, MEM_RELEASE);
         }
     }
 }

@@ -188,14 +188,15 @@ fn build(config: &Config) -> Registry {
     }
     if offline {
         let n = idx(netoff::NETOFF);
-        // (wsock32: Winsock 1.1, the same functions at the same ordinals)
-        for p in ["winhttp.dll", "ws2_32.dll", "wsock32.dll"] {
+        for p in ["winhttp.dll", "ws2_32.dll"] {
             routes.push((p.into(), Route::Hle(n)));
         }
-        // every other way to the network: stubs (a user alias, first in the list, can still
-        // name one of them)
-        for p in netoff::OTHER_NETWORK_DLLS {
-            routes.push((p.into(), Route::Stub));
+        if crate::util::mac_host() {
+            // Winsock 1.1 uses the same ordinals. Other network DLLs go to stubs.
+            routes.push(("wsock32.dll".into(), Route::Hle(n)));
+            for p in netoff::OTHER_NETWORK_DLLS {
+                routes.push((p.into(), Route::Stub));
+            }
         }
     }
     Registry { modules, routes }

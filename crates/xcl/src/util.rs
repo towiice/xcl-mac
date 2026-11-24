@@ -138,13 +138,18 @@ pub fn under_wine() -> bool {
 /// device (`gpu::shader::NATIVE_HOST_MEMORY` is set when the device is made). What differs
 /// there: a fault inside an AVX2 masked store cannot be resumed (so nothing the title writes
 /// may fault: write-watched or lazily committed memory), and every exception is slow.
-/// `XCL_MAC_HOST=1` / `0` overrides the detection.
+/// Under Wine, `XCL_MAC_HOST=1` / `0` overrides the detection.
 pub fn mac_host() -> bool {
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
     static MAC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *MAC.get_or_init(|| {
-        if let Ok(v) = std::env::var("XCL_MAC_HOST") {
-            return v.trim() != "0";
+        if !under_wine() {
+            return false;
+        }
+        match std::env::var("XCL_MAC_HOST").as_deref().map(str::trim) {
+            Ok("1") => return true,
+            Ok("0") => return false,
+            _ => {}
         }
         // SAFETY: ntdll is always loaded; Wine's export fills two pointers to static strings.
         unsafe {

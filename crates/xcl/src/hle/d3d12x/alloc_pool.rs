@@ -88,6 +88,11 @@ pub fn for_list(list: usize, alloc: usize, ty: i32) -> usize {
     backing
 }
 
+/// The physical allocator that owns a list's existing recording.
+pub(super) fn recording_backing(list: usize) -> Option<usize> {
+    STATE.lock().unwrap().as_ref()?.of_list.get(&list).copied()
+}
+
 /// The PC allocator the title's allocator `alloc` stands for now.
 pub fn current(alloc: usize) -> usize {
     if !enabled() {
@@ -173,8 +178,9 @@ pub unsafe fn forget(alloc: usize) {
 
 /// The title resets its allocator `alloc`. `None`: reset it as it is (nothing holds a
 /// recording on it, or this is off). `Some(hr)`: done here – the PC allocator in use was put
-/// aside with its recordings and another one took its place.
-pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
+/// aside with its recordings and another one took its place. The second element names
+/// the physical allocator reset successfully, if any.
+pub unsafe fn title_reset(alloc: *mut c_void) -> Option<(HRESULT, Option<usize>)> {
     if !enabled() {
         return None;
     }
@@ -189,12 +195,13 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
         if c == a {
             return None;
         }
-        return Some(super::real::reset_pc_allocator(c as *mut c_void));
+        let hr = super::real::reset_pc_allocator(c as *mut c_void);
+        return Some((hr, (hr >= 0).then_some(c)));
     }
     let ty = *s.types.get(&a)?;
     // one put aside earlier that nothing uses any more, or a new one
     let reuse = s.aside.get(&a).and_then(|v| v.iter().copied().find(|f| s.backings.get(f).is_none_or(|b| b.free())));
-    let next = match reuse {
+    let (next, reset) = match reuse {
         Some(f) => {
             s.aside.get_mut(&a).unwrap().retain(|&x| x != f);
             if let Some(b) = s.backings.get_mut(&f) {
@@ -202,9 +209,9 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
             }
             let hr = super::real::reset_pc_allocator(f as *mut c_void);
             if hr < 0 {
-                return Some(hr);
+                return Some((hr, None));
             }
-            f
+            (f, Some(f))
         }
         None => {
             let this = ID3D12CommandAllocator::from_raw_borrowed(&alloc)?;
@@ -217,7 +224,7 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
                 super::real::adopt(raw, super::real::Kind::CommandAllocator);
             }
             s.made += 1;
-            raw as usize
+            (raw as usize, None)
         }
     };
     s.aside.entry(a).or_default().push(c);
@@ -231,7 +238,7 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
             s.made
         );
     }
-    Some(0)
+    Some((0, reset))
 }
 
 #[cfg(test)]
@@ -276,6 +283,7 @@ mod tests {
             alloc.Reset().unwrap();
             let second = current(a as usize);
             assert_ne!(second, a as usize, "the list still holds its recording: another PC allocator takes the place");
+        assert_eq!(recording_backing(l as usize), Some(a as usize));
             // … and submits the recording again
             queue.ExecuteCommandLists(&lists);
             executed(queue.as_raw(), &[l]);
