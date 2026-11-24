@@ -147,7 +147,7 @@ pub(super) unsafe extern "system" fn create_command_list_x(this: *mut c_void, pa
             return create_shader_cache_session_x(this, params as *const c_void, alloc as *const GUID, pso as *mut *mut c_void);
         }
     }
-    if (crate::util::mac_host() || crate::util::rosetta()) && pso != 0 && crate::gpu::shader::writable(pso, 8) {
+    if (crate::util::mac_host() || crate::util::rosetta()) && pso != 0 && crate::gpu::shader::readable(pso, 8) {
         return create_shader_cache_session_x(this, params as *const c_void, alloc as *const GUID, pso as *mut *mut c_void);
     }
     let (ty, node) = if params.is_null() { (0, 1) } else { (params.read_unaligned(), params.add(2).read_unaligned()) };
