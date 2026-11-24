@@ -25,6 +25,7 @@
 //! Without the shared heap (it could not be made) a heap keeps its own PC heap: SRV at 2k,
 //! UAV at 2k + 1.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -293,6 +294,11 @@ pub fn unregister(obj: usize) {
             }
             Memory::Title => unsafe { crate::hle::kernelx::runtime_free(h.shadow, crate::hle::kernelx::D3D_DESCRIPTOR_HEAP) },
         }
+        if let Ok(mut tags) = LAST_TAGS.lock() {
+            if let Some(m) = tags.as_mut() {
+                m.retain(|&(o, _), _| o != obj);
+            }
+        }
     }
 }
 
@@ -482,6 +488,89 @@ pub fn words_at(addr32: u32) -> Option<[u32; 8]> {
     let mut w = [0u32; 8];
     unsafe { std::ptr::copy_nonoverlapping(s.at as *const u32, w.as_mut_ptr(), if s.sampler { 4 } else { 8 }) };
     Some(w)
+}
+
+static LAST_TAGS: Mutex<Option<HashMap<(usize, u32), (u64, u32)>>> = Mutex::new(None);
+
+/// Brings the host descriptor heap (`GLOBAL`) up to date with descriptors the title wrote into
+/// heap memory itself (copies of whole slots or converting image slots to buffers/CBVs/zeroes),
+/// before a submission runs (`real::q_execute_command_lists`).
+///
+/// In titles such as Grand Theft Auto VI, the engine places descriptor heaps in its own memory
+/// and copies whole slots there itself without invoking D3D12 view creation APIs. Slots a mesh
+/// shader reads directly by index (not through a table) are made only from what was mirrored:
+/// when a title converts an image view slot into a constant buffer or buffer view, the host slot
+/// previously kept the stale texture view whose upper half the shader read as a buffer at address 0,
+/// triggering a fatal GPU page fault and lost device.
+///
+/// Here, any mapped page of a shader-visible view heap whose slot content changed since the last
+/// submission is mirrored: slots converted to buffers/CBVs or zeroed are populated with a null
+/// raw buffer SRV returning zeros on out-of-bounds reads, while image views copied from other slots
+/// are mirrored to their destination descriptor in `GLOBAL`.
+pub unsafe fn resync_title_writes(_queue: *mut std::ffi::c_void) {
+    let heaps = HEAPS.lock().unwrap();
+    let g = GLOBAL.lock().unwrap();
+    let Some(g) = g.as_ref() else { return };
+
+    let mut tags_lock = LAST_TAGS.lock().unwrap();
+    let tags = tags_lock.get_or_insert_with(HashMap::new);
+
+    for h in heaps.iter().filter(|h| h.visible && !h.sampler) {
+        if h.shadow == 0 {
+            continue;
+        }
+        for (p, &first) in h.pages.iter().enumerate() {
+            if first == UNMAPPED {
+                continue;
+            }
+            let k_start = p as u32 * PAGE_SLOTS;
+            let k_end = (k_start + PAGE_SLOTS).min(h.n);
+            for k in k_start..k_end {
+                let slot_va = h.shadow + (k * SLOT) as usize;
+                let w = std::slice::from_raw_parts(slot_va as *const u32, 8);
+                let tag = ((w[3] as u64) << 32) | (w[0] as u64);
+                let own_idx = first + 2 * (k - k_start);
+                if let Some(&(prev_tag, _)) = tags.get(&(h.obj, k)) {
+                    if prev_tag == tag {
+                        continue;
+                    }
+                }
+
+                let dst_cpu = g.cpu + (own_idx as u64) * (g.inc as u64);
+                if w.iter().all(|&x| x == 0) || (w[3] >> 28 < 8) {
+                    // Overwritten with buffer / CBV or cleared: install null raw buffer SRV
+                    // so mesh shader loads past bounds safely return 0 rather than fault at address 0.
+                    let null_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS,
+                        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Buffer: D3D12_BUFFER_SRV {
+                                FirstElement: 0,
+                                NumElements: 0,
+                                StructureByteStride: 0,
+                                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                            },
+                        },
+                    };
+                    g.dev.CreateShaderResourceView(None, Some(&null_desc), D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dst_cpu as usize });
+                } else if w[3] >> 28 >= 8 && w[0] != own_idx {
+                    // Copied whole slot from another slot index in GLOBAL: mirror source descriptor
+                    let src_idx = w[0];
+                    if src_idx < g.cap {
+                        let src_cpu = g.cpu + (src_idx as u64) * (g.inc as u64);
+                        g.dev.CopyDescriptorsSimple(
+                            1,
+                            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dst_cpu as usize },
+                            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src_cpu as usize },
+                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        );
+                    }
+                }
+                tags.insert((h.obj, k), (tag, w[0]));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
