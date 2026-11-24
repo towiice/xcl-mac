@@ -1067,8 +1067,8 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (67, x::deserialize_pso_x as usize),
                 (70, dev_create_srv_at_x as usize),
                 (71, dev_create_uav_at_x as usize),
-                (73, x::create_command_list_x as usize),
-                (74, x::register_page_pool_x as usize),
+                if crate::util::mac_host() { (73, dev_create_shader_cache_session as usize) } else { (73, x::create_command_list_x as usize) },
+                if crate::util::mac_host() { (74, dev_shader_cache_control as usize) } else { (74, x::register_page_pool_x as usize) },
                 (75, x::unregister_page_pool_x as usize),
                 (76, dev_create_committed_resource_x as usize),
                 // frame pacing (SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX,
@@ -2621,6 +2621,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("CreatePlacedResource1", dev_create_placed_resource1 as usize),
             ("CreateCommandQueue1", dev_create_command_queue1 as usize),
             ("CreateShaderCacheSession", dev_create_shader_cache_session as usize),
+            ("ShaderCacheControl", dev_shader_cache_control as usize),
         ]),
         Kind::CommandList => v.extend_from_slice(&[
             ("Release", cl_release as usize),
@@ -3547,6 +3548,10 @@ pub(super) unsafe extern "system" fn dev_create_shader_cache_session(
     }
 
     hr
+}
+
+pub(super) unsafe extern "system" fn dev_shader_cache_control(_this: *mut c_void, _kinds: u32, _control: u32) -> HRESULT {
+    S_OK
 }
 
 // ---------------------------------------------------------------------------------------
@@ -5647,6 +5652,9 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     }
     // textures in title memory the CPU wrote since: uploaded again first
     super::title_textures::refresh(this);
+    if crate::util::mac_host() {
+        super::console_heap::resync_title_writes(this);
+    }
     // console-shaped lists run as the PC lists they were translated into (split title lists expand
     // into all of their recorded PC segments in exact chronological order)
     let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
