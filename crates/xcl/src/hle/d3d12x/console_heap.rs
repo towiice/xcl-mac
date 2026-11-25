@@ -275,16 +275,25 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
 
 /// The heap object was released for good: its slots go back to unified memory.
 pub fn unregister(obj: usize) {
+    unregister_with_resync(obj, crate::util::mac_host());
+}
+
+fn unregister_with_resync(obj: usize, track_resync: bool) {
     let gone = {
         let mut heaps = HEAPS.lock().unwrap();
-        heaps.iter().position(|h| h.obj == obj).map(|i| heaps.swap_remove(i))
+        heaps.iter().position(|h| h.obj == obj).map(|i| {
+            // Keep registration serialized with tag removal: COM addresses can be reused.
+            if track_resync {
+                if let Ok(mut tags) = LAST_TAGS.lock() {
+                    if let Some(tags) = tags.as_mut() {
+                        tags.retain(|&(heap, _), _| heap != obj);
+                    }
+                }
+            }
+            heaps.swap_remove(i)
+        })
     };
     if let Some(h) = gone {
-        if let Ok(mut tags) = LAST_TAGS.lock() {
-            if let Some(m) = tags.as_mut() {
-                m.retain(|&(heap, _), _| heap != obj);
-            }
-        }
         for (p, &f) in h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED) {
             release_global(f, page_descriptors(h.n, p as u32));
         }
@@ -644,7 +653,7 @@ mod tests {
             sampler: false,
             pages: vec![UNMAPPED],
             visible: true,
-            memory: Memory::Title,
+            memory: Memory::Uma,
         });
         {
             let mut lock = LAST_TAGS.lock().unwrap();
@@ -653,12 +662,14 @@ mod tests {
             tags.insert((obj_a, 3), 0x2222);
             tags.insert((obj_b, 0), 0x3333);
         }
-        unregister(obj_a);
-        let lock = LAST_TAGS.lock().unwrap();
-        let tags = lock.as_ref().unwrap();
+        // Exercise the Mac cleanup path on any test host.
+        unregister_with_resync(obj_a, true);
+        assert!(start(obj_a).is_none());
+        let mut lock = LAST_TAGS.lock().unwrap();
+        let tags = lock.as_mut().unwrap();
         assert!(!tags.contains_key(&(obj_a, 0)));
         assert!(!tags.contains_key(&(obj_a, 3)));
-        assert_eq!(tags.get(&(obj_b, 0)), Some(&0x3333));
+        assert_eq!(tags.remove(&(obj_b, 0)), Some(0x3333));
     }
 
     /// Ranges of the shared heap: released ones first (first fit, split), then new ones, and
