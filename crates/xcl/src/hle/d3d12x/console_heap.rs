@@ -277,16 +277,14 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
 pub fn unregister(obj: usize) {
     let gone = {
         let mut heaps = HEAPS.lock().unwrap();
-        heaps.iter().position(|h| h.obj == obj).map(|i| {
-            if crate::util::mac_host() {
-                if let Some(tags) = LAST_TAGS.lock().unwrap().as_mut() {
-                    tags.retain(|(heap, _), _| *heap != obj);
-                }
-            }
-            heaps.swap_remove(i)
-        })
+        heaps.iter().position(|h| h.obj == obj).map(|i| heaps.swap_remove(i))
     };
     if let Some(h) = gone {
+        if let Ok(mut tags) = LAST_TAGS.lock() {
+            if let Some(m) = tags.as_mut() {
+                m.retain(|&(heap, _), _| heap != obj);
+            }
+        }
         for (p, &f) in h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED) {
             release_global(f, page_descriptors(h.n, p as u32));
         }
@@ -630,6 +628,37 @@ mod tests {
         assert!(cpu_mirror_srv(&heaps, 69).is_none()); // UAV
         assert!(cpu_mirror_srv(&heaps, 72).is_none()); // past the last partial page
         assert!(cpu_mirror_srv(&heaps, 0).is_none()); // no assigned page
+    }
+
+    #[test]
+    fn unregister_clears_cached_resync_tags_for_that_heap() {
+        let obj_a = 0xDEAD_1001usize;
+        let obj_b = 0xDEAD_1002usize;
+        HEAPS.lock().unwrap().push(Heap {
+            obj: obj_a,
+            shadow: 0,
+            n: 4,
+            pc_cpu: 0,
+            pc_gpu: 0,
+            inc: 32,
+            sampler: false,
+            pages: vec![UNMAPPED],
+            visible: true,
+            memory: Memory::Title,
+        });
+        {
+            let mut lock = LAST_TAGS.lock().unwrap();
+            let tags = lock.get_or_insert_with(HashMap::new);
+            tags.insert((obj_a, 0), 0x1111);
+            tags.insert((obj_a, 3), 0x2222);
+            tags.insert((obj_b, 0), 0x3333);
+        }
+        unregister(obj_a);
+        let lock = LAST_TAGS.lock().unwrap();
+        let tags = lock.as_ref().unwrap();
+        assert!(!tags.contains_key(&(obj_a, 0)));
+        assert!(!tags.contains_key(&(obj_a, 3)));
+        assert_eq!(tags.get(&(obj_b, 0)), Some(&0x3333));
     }
 
     /// Ranges of the shared heap: released ones first (first fit, split), then new ones, and
