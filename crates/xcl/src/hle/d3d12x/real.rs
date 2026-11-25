@@ -3375,11 +3375,7 @@ unsafe extern "system" fn session_qi(this: *mut DummyShaderCacheSession, riid: *
     }
     let iid = riid.read_unaligned();
     let iid_value = windows::core::GUID::from_values(iid.data1, iid.data2, iid.data3, iid.data4);
-    if !super::device_x::is_shader_cache_session_guid(&iid)
-        && iid_value != ID3D12DeviceChild::IID
-        && iid_value != ID3D12Object::IID
-        && iid_value != windows::core::IUnknown::IID
-    {
+    if !super::device_x::is_shader_cache_session_guid(&iid) && iid_value != ID3D12Object::IID {
         return E_NOINTERFACE;
     }
     session_add_ref(this);
